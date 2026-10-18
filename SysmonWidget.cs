@@ -355,7 +355,12 @@ namespace SysmonWidget
     {
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wp, IntPtr lp);
+        [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int n);
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
 
         const int HistLen = 60;
         const int BaseWidth = 240, MinWidth = 190;
@@ -375,6 +380,7 @@ namespace SysmonWidget
         NotifyIcon tray;
         ContextMenuStrip menu;
         ToolStripMenuItem miTopMost, miAutoStart, miBits, miBytes;
+        FontWheelFilter wheelFilter;
 
         Font fLabel, fValue, fSmall;
         readonly Brush bLabel = new SolidBrush(Color.FromArgb(170, 170, 180));
@@ -394,6 +400,9 @@ namespace SysmonWidget
         {
             settings = Settings.Load();
 
+            // 自分で DPI と文字倍率を掛ける。WinForms の自動スケールが重なると、
+            // 文字サイズもウィンドウサイズも指定どおりにならなくなる。
+            AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -429,11 +438,35 @@ namespace SysmonWidget
         void CreateFonts()
         {
             Font[] old = { fLabel, fValue, fSmall };
-            float k = settings.FontScale;
-            fLabel = new Font("Segoe UI", 9f * k, FontStyle.Regular);
-            fValue = new Font("Segoe UI Semibold", 9.5f * k, FontStyle.Regular);
-            fSmall = new Font("Segoe UI", 8f * k, FontStyle.Regular);
+            fLabel = MakeFont("Segoe UI", 9f, FontStyle.Regular);
+            fValue = MakeFont("Segoe UI Semibold", 9.5f, FontStyle.Regular);
+            fSmall = MakeFont("Segoe UI", 8f, FontStyle.Regular);
             foreach (Font f in old) if (f != null) f.Dispose();
+        }
+
+        // ポイント指定だと GDI の DPI と S() の DPI がずれて、文字だけ変わらないことがある。
+        // レイアウトと同じ倍率でピクセルサイズにする。
+        Font MakeFont(string family, float pt, FontStyle style)
+        {
+            float px = Math.Max(1f, pt * settings.FontScale * Math.Max(scale, 1f) * 96f / 72f);
+            try { return new Font(family, px, style, GraphicsUnit.Pixel); }
+            catch
+            {
+                try { return new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel); }
+                catch { return new Font(FontFamily.GenericSansSerif, px, FontStyle.Regular, GraphicsUnit.Pixel); }
+            }
+        }
+
+        void QueueStep(int dir)
+        {
+            if (!IsHandleCreated) { StepFontScale(dir); return; }
+            BeginInvoke(new Action(delegate { StepFontScale(dir); }));
+        }
+
+        void QueueScale(float k)
+        {
+            if (!IsHandleCreated) { SetFontScale(k); return; }
+            BeginInvoke(new Action(delegate { SetFontScale(k); }));
         }
 
         void SetSizeClamped(int w, int h)
@@ -480,7 +513,8 @@ namespace SysmonWidget
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x80; // WS_EX_TOOLWINDOW: タスクバー / Alt+Tab に出さない
+                cp.Style |= 0x00040000; // WS_THICKFRAME: これがないと端のヒットテストではサイズ変更が始まらない
+                cp.ExStyle |= 0x80;     // WS_EX_TOOLWINDOW: タスクバー / Alt+Tab に出さない
                 return cp;
             }
         }
@@ -547,11 +581,11 @@ namespace SysmonWidget
             menu.Opening += (s, e) => { try { miAutoStart.Checked = AutoStart.IsEnabled(); } catch { } };
 
             var miFont = new ToolStripMenuItem("文字サイズ");
-            miFont.DropDownItems.Add(new ToolStripMenuItem("大きく", null, (s, e) => StepFontScale(1))
+            miFont.DropDownItems.Add(new ToolStripMenuItem("大きく", null, (s, e) => QueueStep(1))
             {
                 ShortcutKeyDisplayString = "Ctrl+ホイール↑"
             });
-            miFont.DropDownItems.Add(new ToolStripMenuItem("小さく", null, (s, e) => StepFontScale(-1))
+            miFont.DropDownItems.Add(new ToolStripMenuItem("小さく", null, (s, e) => QueueStep(-1))
             {
                 ShortcutKeyDisplayString = "Ctrl+ホイール↓"
             });
@@ -559,7 +593,7 @@ namespace SysmonWidget
             foreach (float f in FontScales)
             {
                 float val = f;
-                var item = new ToolStripMenuItem((int)Math.Round(f * 100) + "%", null, (s, e) => SetFontScale(val));
+                var item = new ToolStripMenuItem((int)Math.Round(f * 100) + "%", null, (s, e) => QueueScale(val));
                 item.Tag = val;
                 miFont.DropDownItems.Add(item);
             }
@@ -631,6 +665,11 @@ namespace SysmonWidget
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
+            if (wheelFilter == null)
+            {
+                wheelFilter = new FontWheelFilter(this);
+                Application.AddMessageFilter(wheelFilter);
+            }
             int round = 2; // DWMWCP_ROUND（Windows 11 の角丸）
             try { DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int)); } catch { }
         }
@@ -702,8 +741,12 @@ namespace SysmonWidget
         {
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
+            // 端やグリップはサイズ変更。内側は移動。
+            // NCHITTEST がクライアント扱いに戻しても、ここでも同じ判定にする。
+            int ht = HitTestClient(e.Location);
+            if (ht == 1) ht = 2; // HTCAPTION
             ReleaseCapture();
-            SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
+            SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)ht, IntPtr.Zero);
             SaveBounds();
         }
 
@@ -713,22 +756,71 @@ namespace SysmonWidget
             if ((ModifierKeys & Keys.Control) != 0 && e.Delta != 0) StepFontScale(e.Delta > 0 ? 1 : -1);
         }
 
-        // 枠なしウィンドウでも、端をつかんだら OS 標準のリサイズになるようにする
+        int HitTestClient(Point pt)
+        {
+            int edge = Math.Max(ResizeBorder, (int)Math.Round(8 * Math.Max(scale, 1f)));
+            int grip = Math.Max(edge, (int)Math.Round(14 * Math.Max(scale, 1f)));
+            int w = ClientSize.Width, h = ClientSize.Height;
+            if (w <= 0 || h <= 0) return 1;
+            if (pt.X >= w - grip && pt.Y >= h - grip) return 17; // HTBOTTOMRIGHT
+            bool l = pt.X < edge, r = pt.X >= w - edge;
+            bool t = pt.Y < edge, b = pt.Y >= h - edge;
+            if (t && l) return 13; // HTTOPLEFT
+            if (t && r) return 14; // HTTOPRIGHT
+            if (t) return 12;       // HTTOP
+            if (b && l) return 16;  // HTBOTTOMLEFT
+            if (b && r) return 17;  // HTBOTTOMRIGHT
+            if (b) return 15;       // HTBOTTOM
+            if (l) return 10;       // HTLEFT
+            if (r) return 11;       // HTRIGHT
+            return 1;               // HTCLIENT
+        }
+
+        void ApplyResizeCursor(Point pt)
+        {
+            switch (HitTestClient(pt))
+            {
+                case 10: case 11: Cursor = Cursors.SizeWE; break;
+                case 12: case 15: Cursor = Cursors.SizeNS; break;
+                case 13: case 17: Cursor = Cursors.SizeNWSE; break;
+                case 14: case 16: Cursor = Cursors.SizeNESW; break;
+                default: Cursor = Cursors.Default; break;
+            }
+        }
+
+        // 枠なしウィンドウは、ヒットテストでサイズ用の端を返しても OS がリサイズを始めない。
+        // クリックはクライアントのまま受けて、移動と同じ SendMessage でサイズ変更を始める。
+        // WS_THICKFRAME の見た目の枠は WM_NCCALCSIZE で消す。
         protected override void WndProc(ref Message m)
         {
-            base.WndProc(ref m);
-            const int WM_NCHITTEST = 0x84, HTCLIENT = 1;
-            if (m.Msg != WM_NCHITTEST || (int)m.Result != HTCLIENT) return;
+            const int WM_NCCALCSIZE = 0x83, WM_SETCURSOR = 0x20;
+            if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero)
+            {
+                if (IsHandleCreated && IsZoomed(Handle))
+                {
+                    RECT rc = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                    int pad = GetSystemMetrics(92); // SM_CXPADDEDBORDER
+                    int fx = GetSystemMetrics(32) + pad; // SM_CXFRAME
+                    int fy = GetSystemMetrics(33) + pad; // SM_CYFRAME
+                    rc.Left += fx; rc.Top += fy; rc.Right -= fx; rc.Bottom -= fy;
+                    Marshal.StructureToPtr(rc, m.LParam, false);
+                }
+                m.Result = IntPtr.Zero;
+                return;
+            }
 
-            long lp = m.LParam.ToInt64();
-            Point pt = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
-            int edge = (int)Math.Round(ResizeBorder * scale);
-            bool l = pt.X < edge, r = pt.X >= ClientSize.Width - edge;
-            bool t = pt.Y < edge, b = pt.Y >= ClientSize.Height - edge;
-            int ht = t ? (l ? 13 : r ? 14 : 12)      // HTTOPLEFT / HTTOPRIGHT / HTTOP
-                   : b ? (l ? 16 : r ? 17 : 15)      // HTBOTTOMLEFT / HTBOTTOMRIGHT / HTBOTTOM
-                   : l ? 10 : r ? 11 : HTCLIENT;     // HTLEFT / HTRIGHT
-            m.Result = (IntPtr)ht;
+            if (m.Msg == WM_SETCURSOR && IsHandleCreated)
+            {
+                Point pt = PointToClient(Cursor.Position);
+                if (HitTestClient(pt) != 1)
+                {
+                    ApplyResizeCursor(pt);
+                    m.Result = (IntPtr)1;
+                    return;
+                }
+            }
+
+            base.WndProc(ref m);
         }
 
         protected override void OnResizeEnd(EventArgs e)
@@ -748,6 +840,11 @@ namespace SysmonWidget
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            if (wheelFilter != null)
+            {
+                Application.RemoveMessageFilter(wheelFilter);
+                wheelFilter = null;
+            }
             stopEvent.Set();
             SaveBounds();
             if (tray != null)
@@ -794,7 +891,9 @@ namespace SysmonWidget
                 g.DrawString("↑ " + FormatSpeed(s.Up), fValue, bu, left + half, y);
             y += S(NetSpeedH);
 
-            DrawGraph(g, new Rectangle(left, y, right - left, ClientSize.Height - S(Pad) - S(4) - y));
+            int graphH = ClientSize.Height - S(Pad) - S(4) - y;
+            if (graphH > 2 && right > left)
+                DrawGraph(g, new Rectangle(left, y, right - left, graphH));
             DrawResizeGrip(g);
         }
 
@@ -839,6 +938,7 @@ namespace SysmonWidget
 
         static void FillRounded(Graphics g, Brush b, Rectangle r)
         {
+            if (r.Width <= 0 || r.Height <= 0) return;
             int d = Math.Min(r.Height, r.Width);
             if (d <= 1) { g.FillRectangle(b, r); return; }
             using (var path = new GraphicsPath())
@@ -884,11 +984,36 @@ namespace SysmonWidget
         {
             if (disposing)
             {
+                if (wheelFilter != null) Application.RemoveMessageFilter(wheelFilter);
                 fLabel.Dispose(); fValue.Dispose(); fSmall.Dispose();
                 bLabel.Dispose(); bValue.Dispose(); bDim.Dispose(); bTrack.Dispose(); pSep.Dispose();
                 if (menu != null) menu.Dispose();
             }
             base.Dispose(disposing);
+        }
+
+        // フォーカスがなくても、ウィジェットの上で Ctrl+ホイールなら文字サイズを変える。
+        sealed class FontWheelFilter : IMessageFilter
+        {
+            readonly WidgetForm owner;
+            public FontWheelFilter(WidgetForm owner) { this.owner = owner; }
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                const int WM_MOUSEWHEEL = 0x020A;
+                if (m.Msg != WM_MOUSEWHEEL) return false;
+                if ((Control.ModifierKeys & Keys.Control) == 0) return false;
+                if (owner.IsDisposed || !owner.Visible) return false;
+                if (owner.menu != null && owner.menu.Visible) return false;
+
+                int delta = (short)((m.WParam.ToInt32() >> 16) & 0xFFFF);
+                if (delta == 0) return false;
+                int lp = m.LParam.ToInt32();
+                var screen = new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF));
+                if (!owner.Bounds.Contains(screen)) return false;
+                owner.StepFontScale(delta > 0 ? 1 : -1);
+                return true;
+            }
         }
     }
 }
