@@ -355,6 +355,7 @@ namespace SysmonWidget
     {
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wp, IntPtr lp);
+        [DllImport("user32.dll")] static extern IntPtr SetCursor(IntPtr hCursor);
         [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hWnd);
         [DllImport("user32.dll")] static extern int GetSystemMetrics(int n);
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
@@ -778,14 +779,18 @@ namespace SysmonWidget
 
         void ApplyResizeCursor(Point pt)
         {
+            Cursor c;
             switch (HitTestClient(pt))
             {
-                case 10: case 11: Cursor = Cursors.SizeWE; break;
-                case 12: case 15: Cursor = Cursors.SizeNS; break;
-                case 13: case 17: Cursor = Cursors.SizeNWSE; break;
-                case 14: case 16: Cursor = Cursors.SizeNESW; break;
-                default: Cursor = Cursors.Default; break;
+                case 10: case 11: c = Cursors.SizeWE; break;
+                case 12: case 15: c = Cursors.SizeNS; break;
+                case 13: case 17: c = Cursors.SizeNWSE; break;
+                case 14: case 16: c = Cursors.SizeNESW; break;
+                default: c = Cursors.Default; break;
             }
+            // Cursor プロパティへ代入すると、ポインタが窓の中にある間
+            // WM_SETCURSOR を同期送信する。このハンドラからだと無限再帰になる。
+            SetCursor(c.Handle);
         }
 
         // 枠なしウィンドウは、ヒットテストでサイズ用の端を返しても OS がリサイズを始めない。
@@ -1006,9 +1011,11 @@ namespace SysmonWidget
                 if (owner.IsDisposed || !owner.Visible) return false;
                 if (owner.menu != null && owner.menu.Visible) return false;
 
-                int delta = (short)((m.WParam.ToInt32() >> 16) & 0xFFFF);
+                long wp = m.WParam.ToInt64();
+                int delta = (short)((wp >> 16) & 0xFFFF);
                 if (delta == 0) return false;
-                int lp = m.LParam.ToInt32();
+                long lp64 = m.LParam.ToInt64();
+                int lp = unchecked((int)lp64);
                 var screen = new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF));
                 if (!owner.Bounds.Contains(screen)) return false;
                 owner.StepFontScale(delta > 0 ? 1 : -1);
