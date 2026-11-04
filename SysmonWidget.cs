@@ -443,7 +443,7 @@ namespace SysmonWidget
         const int RightColMin = 168, PanelGap = 10;
         const int Pad = 12, LabelH = 18, BarH = 6, RowGap = 10;
         const int SepH = 15, NetHeaderH = 18, NetSpeedH = 22, GraphH = 36, MinGraphH = 20;
-        const int ClockDigitalH = 56, ClockAnalogH = 120, PomoH = 72, GmailRowH = 34, GmailHeaderH = 20;
+        const int ClockDigitalH = 66, ClockAnalogH = 120, PomoH = 72, GmailRowH = 34, GmailHeaderH = 20;
         const int ResizeBorder = 6;
         static readonly float[] FontScales = { 0.75f, 0.9f, 1.0f, 1.15f, 1.3f, 1.5f, 1.75f, 2.0f };
         static readonly int[] WorkMins = { 15, 20, 25, 30, 45, 50, 60 };
@@ -1499,10 +1499,14 @@ namespace SysmonWidget
             {
                 string time = now.ToString("HH:mm:ss");
                 string date = now.ToString("yyyy/MM/dd ddd", CultureInfo.GetCultureInfo("ja-JP"));
+                float timeY = r.Y + S(14);
                 float tw = g.MeasureString(time, fClock).Width;
-                g.DrawString(time, fClock, bValue, r.X + Math.Max(0, (r.Width - tw) / 2f), r.Y + S(14));
+                g.DrawString(time, fClock, bValue, r.X + Math.Max(0, (r.Width - tw) / 2f), timeY);
+                // 数字にはディセンダが無いので、日付はベースライン直下から描く（行の高さで並べると間延びする）
+                FontFamily ff = fClock.FontFamily;
+                float ascent = fClock.Size * ff.GetCellAscent(fClock.Style) / ff.GetEmHeight(fClock.Style);
                 float dw = g.MeasureString(date, fSmall).Width;
-                g.DrawString(date, fSmall, bDim, r.X + Math.Max(0, (r.Width - dw) / 2f), r.Y + S(40));
+                g.DrawString(date, fSmall, bDim, r.X + Math.Max(0, (r.Width - dw) / 2f), timeY + ascent + S(3));
             }
         }
 
