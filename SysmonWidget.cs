@@ -276,6 +276,7 @@ namespace SysmonWidget
         public int PomodoroBreakMin = 5;
         public bool ShowGmail;
         public int GmailCount = 5;
+        public int GmailIntervalSec = 60; // 更新間隔（秒）
         public string GmailClientId = "";
         public string GmailClientSecret = "";
 
@@ -331,6 +332,9 @@ namespace SysmonWidget
                         case "GmailCount":
                             if (int.TryParse(v, out i) && i >= 3 && i <= 10) s.GmailCount = i;
                             break;
+                        case "GmailIntervalSec":
+                            if (int.TryParse(v, out i) && i >= 15 && i <= 3600) s.GmailIntervalSec = i;
+                            break;
                         case "GmailClientId": s.GmailClientId = v; break;
                         case "GmailClientSecret": s.GmailClientSecret = v; break;
                     }
@@ -358,6 +362,7 @@ namespace SysmonWidget
                     "PomodoroBreakMin=" + PomodoroBreakMin,
                     "ShowGmail=" + ShowGmail,
                     "GmailCount=" + GmailCount,
+                    "GmailIntervalSec=" + GmailIntervalSec,
                     "GmailClientId=" + GmailClientId,
                     "GmailClientSecret=" + GmailClientSecret
                 });
@@ -409,6 +414,7 @@ namespace SysmonWidget
         static readonly float[] FontScales = { 0.75f, 0.9f, 1.0f, 1.15f, 1.3f, 1.5f, 1.75f, 2.0f };
         static readonly int[] WorkMins = { 15, 20, 25, 30, 45, 50, 60 };
         static readonly int[] BreakMins = { 3, 5, 10, 15, 20 };
+        static readonly int[] GmailIntervals = { 15, 30, 60, 120, 300, 600 };
 
         readonly Settings settings;
         readonly float scale;
@@ -842,6 +848,26 @@ namespace SysmonWidget
                     if (mi != null && mi.Tag is int) mi.Checked = (int)mi.Tag == settings.GmailCount;
                 }
             };
+            var miGmailInterval = new ToolStripMenuItem("更新間隔");
+            foreach (int sec in GmailIntervals)
+            {
+                int val = sec;
+                miGmailInterval.DropDownItems.Add(new ToolStripMenuItem(FormatGmailInterval(val), null, (s, e) =>
+                {
+                    settings.GmailIntervalSec = val;
+                    settings.Save();
+                    gmailNextFetchUtc = DateTime.MinValue;
+                    EnsureGmailFetch(true);
+                }) { Tag = val });
+            }
+            miGmailInterval.DropDownOpening += (s, e) =>
+            {
+                foreach (ToolStripItem it in miGmailInterval.DropDownItems)
+                {
+                    var mi = it as ToolStripMenuItem;
+                    if (mi != null && mi.Tag is int) mi.Checked = (int)mi.Tag == settings.GmailIntervalSec;
+                }
+            };
             miGmail.DropDownItems.Add(miGmailShow);
             miGmail.DropDownItems.Add(new ToolStripSeparator());
             miGmail.DropDownItems.Add(miGmailConnect);
@@ -849,6 +875,7 @@ namespace SysmonWidget
             miGmail.DropDownItems.Add(miGmailCred);
             miGmail.DropDownItems.Add(miGmailRefresh);
             miGmail.DropDownItems.Add(miGmailCount);
+            miGmail.DropDownItems.Add(miGmailInterval);
             miGmail.DropDownOpening += (s, e) =>
             {
                 miGmailShow.Checked = settings.ShowGmail;
@@ -857,6 +884,7 @@ namespace SysmonWidget
                 miGmailDisconnect.Enabled = on && gmail.IsAuthorized;
                 miGmailRefresh.Enabled = on && gmail.IsAuthorized;
                 miGmailCount.Enabled = on;
+                miGmailInterval.Enabled = on;
             };
 
             var miReset = new ToolStripMenuItem("位置とサイズをリセット", null, (s, e) =>
@@ -1065,6 +1093,13 @@ namespace SysmonWidget
             });
         }
 
+        static string FormatGmailInterval(int sec)
+        {
+            if (sec < 60) return sec + " 秒";
+            if (sec % 60 == 0) return (sec / 60) + " 分";
+            return (sec / 60) + " 分 " + (sec % 60) + " 秒";
+        }
+
         void EnsureGmailFetch(bool force)
         {
             if (!settings.ShowGmail) return;
@@ -1075,7 +1110,8 @@ namespace SysmonWidget
             }
             if (!force && DateTime.UtcNow < gmailNextFetchUtc) return;
             if (gmailWorker != null && gmailWorker.IsAlive) return;
-            gmailNextFetchUtc = DateTime.UtcNow.AddSeconds(60);
+            int interval = Math.Max(15, Math.Min(3600, settings.GmailIntervalSec));
+            gmailNextFetchUtc = DateTime.UtcNow.AddSeconds(interval);
             gmailStatus = "更新中…";
             string cid = settings.GmailClientId;
             string secret = settings.GmailClientSecret;

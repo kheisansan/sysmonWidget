@@ -36,6 +36,7 @@ enum Layout {
     static let fontScales: [CGFloat] = [0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0]
     static let workMins = [15, 20, 25, 30, 45, 50, 60]
     static let breakMins = [3, 5, 10, 15, 20]
+    static let gmailIntervals = [15, 30, 60, 120, 300, 600]
 
     static func metricsContentHeight(_ graph: CGFloat) -> CGFloat {
         pad * 2 + 4 * (labelH + barH + rowGap) + sepH + netHeaderH + netSpeedH + graph
@@ -145,6 +146,7 @@ final class Settings {
     var pomodoroBreakMin = 5
     var showGmail = false
     var gmailCount = 5
+    var gmailIntervalSec = 60
     var gmailClientId = ""
     var gmailClientSecret = ""
 
@@ -190,6 +192,8 @@ final class Settings {
             case "ShowGmail": if let b = parseBool(String(value)) { s.showGmail = b }
             case "GmailCount":
                 if let n = Int(value), (3...10).contains(n) { s.gmailCount = n }
+            case "GmailIntervalSec":
+                if let n = Int(value), (15...3600).contains(n) { s.gmailIntervalSec = n }
             case "GmailClientId": s.gmailClientId = String(value)
             case "GmailClientSecret": s.gmailClientSecret = String(value)
             default: break
@@ -215,6 +219,7 @@ final class Settings {
         lines.append("PomodoroBreakMin=\(pomodoroBreakMin)")
         lines.append("ShowGmail=\(showGmail)")
         lines.append("GmailCount=\(gmailCount)")
+        lines.append("GmailIntervalSec=\(gmailIntervalSec)")
         lines.append("GmailClientId=\(gmailClientId)")
         lines.append("GmailClientSecret=\(gmailClientSecret)")
         do {
@@ -1259,6 +1264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var workMenu: NSMenu?
     private var breakMenu: NSMenu?
     private var gmailCountMenu: NSMenu?
+    private var gmailIntervalMenu: NSMenu?
     private var topMostItem: NSMenuItem?
     private var autoStartItem: NSMenuItem?
     private var bitsItem: NSMenuItem?
@@ -1623,6 +1629,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gmailCountMenu = countMenu
         let countItem = NSMenuItem(title: "表示件数", action: nil, keyEquivalent: "")
         countItem.submenu = countMenu
+        let intervalMenu = NSMenu(title: "更新間隔")
+        intervalMenu.autoenablesItems = false
+        intervalMenu.delegate = self
+        for sec in Layout.gmailIntervals {
+            let item = NSMenuItem(title: Self.formatGmailInterval(sec), action: #selector(setGmailInterval(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = sec
+            intervalMenu.addItem(item)
+        }
+        gmailIntervalMenu = intervalMenu
+        let intervalItem = NSMenuItem(title: "更新間隔", action: nil, keyEquivalent: "")
+        intervalItem.submenu = intervalMenu
         gmailMenu.addItem(gmailShow)
         gmailMenu.addItem(.separator())
         gmailMenu.addItem(gmailConnect)
@@ -1630,6 +1648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gmailMenu.addItem(gmailCred)
         gmailMenu.addItem(gmailRefresh)
         gmailMenu.addItem(countItem)
+        gmailMenu.addItem(intervalItem)
         let gmailItem = NSMenuItem(title: "Gmail", action: nil, keyEquivalent: "")
         gmailItem.submenu = gmailMenu
 
@@ -1676,6 +1695,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for item in menu.items { item.state = item.tag == settings.pomodoroBreakMin ? .on : .off }
         } else if menu === gmailCountMenu {
             for item in menu.items { item.state = item.tag == settings.gmailCount ? .on : .off }
+        } else if menu === gmailIntervalMenu {
+            for item in menu.items { item.state = item.tag == settings.gmailIntervalSec ? .on : .off }
         } else if menu === rootMenu {
             topMostItem?.state = settings.topMost ? .on : .off
             autoStartItem?.state = AutoStart.isEnabled() ? .on : .off
@@ -1861,6 +1882,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ensureGmailFetch(force: true)
     }
 
+    @objc private func setGmailInterval(_ sender: NSMenuItem) {
+        settings.gmailIntervalSec = sender.tag
+        settings.save()
+        gmailNextFetch = .distantPast
+        ensureGmailFetch(force: true)
+    }
+
+    private static func formatGmailInterval(_ sec: Int) -> String {
+        if sec < 60 { return "\(sec) 秒" }
+        if sec % 60 == 0 { return "\(sec / 60) 分" }
+        return "\(sec / 60) 分 \(sec % 60) 秒"
+    }
+
     private func ensureGmailFetch(force: Bool) {
         guard settings.showGmail else { return }
         if !gmail.isAuthorized {
@@ -1871,7 +1905,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !force, Date() < gmailNextFetch { return }
         if gmailFetching { return }
         gmailFetching = true
-        gmailNextFetch = Date().addingTimeInterval(60)
+        let interval = max(15, min(3600, settings.gmailIntervalSec))
+        gmailNextFetch = Date().addingTimeInterval(TimeInterval(interval))
         widget?.gmailStatus = "更新中…"
         widget?.needsDisplay = true
         let cid = settings.gmailClientId
