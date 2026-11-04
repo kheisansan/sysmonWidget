@@ -24,8 +24,11 @@ compile() {
         -framework AppKit \
         -framework IOKit \
         -framework CoreWLAN \
+        -framework Security \
         -o "$OBJ/SysmonWidget-${arch}" \
-        "$ROOT/mac/SysmonWidget.swift"
+        "$ROOT/mac/main.swift" \
+        "$ROOT/mac/SysmonWidget.swift" \
+        "$ROOT/mac/GmailClient.swift"
 }
 
 compile x86_64

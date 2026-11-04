@@ -16,6 +16,8 @@ enum Layout {
     static let histLen = 60
     static let baseWidth: CGFloat = 240
     static let minWidth: CGFloat = 190
+    static let rightColMin: CGFloat = 168
+    static let panelGap: CGFloat = 10
     static let pad: CGFloat = 12
     static let labelH: CGFloat = 18
     static let barH: CGFloat = 6
@@ -25,11 +27,28 @@ enum Layout {
     static let netSpeedH: CGFloat = 22
     static let graphH: CGFloat = 36
     static let minGraphH: CGFloat = 20
+    static let clockDigitalH: CGFloat = 56
+    static let clockAnalogH: CGFloat = 120
+    static let pomoH: CGFloat = 72
+    static let gmailRowH: CGFloat = 34
+    static let gmailHeaderH: CGFloat = 20
     static let resizeBorder: CGFloat = 6
     static let fontScales: [CGFloat] = [0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0]
+    static let workMins = [15, 20, 25, 30, 45, 50, 60]
+    static let breakMins = [3, 5, 10, 15, 20]
 
-    static func contentHeight(_ graph: CGFloat) -> CGFloat {
+    static func metricsContentHeight(_ graph: CGFloat) -> CGFloat {
         pad * 2 + 4 * (labelH + barH + rowGap) + sepH + netHeaderH + netSpeedH + graph
+    }
+
+    static func sidePanelsMinHeight(settings: Settings) -> CGFloat {
+        var h = pad * 2
+        if settings.showClock {
+            h += (settings.clockAnalog ? clockAnalogH : clockDigitalH) + 8
+        }
+        if settings.showPomodoro { h += pomoH + 8 }
+        if settings.showGmail { h += gmailHeaderH + CGFloat(settings.gmailCount) * gmailRowH + 8 }
+        return max(h, metricsContentHeight(minGraphH))
     }
 }
 
@@ -119,6 +138,17 @@ final class Settings {
     var bits = true
     var opacity = 0.9
     var fontScale: CGFloat = 1
+    var showClock = false
+    var clockAnalog = false
+    var showPomodoro = false
+    var pomodoroWorkMin = 25
+    var pomodoroBreakMin = 5
+    var showGmail = false
+    var gmailCount = 5
+    var gmailClientId = ""
+    var gmailClientSecret = ""
+
+    var anySidePanel: Bool { showClock || showPomodoro || showGmail }
 
     static func supportDirectory() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -150,6 +180,18 @@ final class Settings {
                 if let d = Double(value) {
                     s.fontScale = min(maxFontScale, max(minFontScale, CGFloat(d)))
                 }
+            case "ShowClock": if let b = parseBool(String(value)) { s.showClock = b }
+            case "ClockAnalog": if let b = parseBool(String(value)) { s.clockAnalog = b }
+            case "ShowPomodoro": if let b = parseBool(String(value)) { s.showPomodoro = b }
+            case "PomodoroWorkMin":
+                if let n = Int(value), (1...120).contains(n) { s.pomodoroWorkMin = n }
+            case "PomodoroBreakMin":
+                if let n = Int(value), (1...60).contains(n) { s.pomodoroBreakMin = n }
+            case "ShowGmail": if let b = parseBool(String(value)) { s.showGmail = b }
+            case "GmailCount":
+                if let n = Int(value), (3...10).contains(n) { s.gmailCount = n }
+            case "GmailClientId": s.gmailClientId = String(value)
+            case "GmailClientSecret": s.gmailClientSecret = String(value)
             default: break
             }
         }
@@ -166,6 +208,15 @@ final class Settings {
         lines.append("Bits=\(bits)")
         lines.append("Opacity=\(String(opacity))")
         lines.append("FontScale=\(String(Double(fontScale)))")
+        lines.append("ShowClock=\(showClock)")
+        lines.append("ClockAnalog=\(clockAnalog)")
+        lines.append("ShowPomodoro=\(showPomodoro)")
+        lines.append("PomodoroWorkMin=\(pomodoroWorkMin)")
+        lines.append("PomodoroBreakMin=\(pomodoroBreakMin)")
+        lines.append("ShowGmail=\(showGmail)")
+        lines.append("GmailCount=\(gmailCount)")
+        lines.append("GmailClientId=\(gmailClientId)")
+        lines.append("GmailClientSecret=\(gmailClientSecret)")
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try lines.joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
@@ -617,18 +668,34 @@ final class WidgetView: NSView {
     var snapshot: Snapshot?
     var upHist: [Double] = []
     var downHist: [Double] = []
+    var gmailItems: [GmailMailItem] = []
+    var gmailStatus = ""
+    var gmailAuthorized = false
     var onBoundsChanged: (() -> Void)?
     var onStepFont: ((Int) -> Void)?
     var contextMenu: NSMenu?
+
+    // ポモドーロ: 0=停止 1=作業 2=休憩
+    var pomoPhase = 0
+    var pomoPaused = false
+    var pomoDeadline = Date()
+    var pomoRemainSec = 25 * 60
+    private var pomoToggleRect = NSRect.zero
+
     private var labelFont = NSFont.systemFont(ofSize: 9)
     private var valueFont = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
     private var smallFont = NSFont.systemFont(ofSize: 8)
+    private var clockFont = NSFont.systemFont(ofSize: 22, weight: .semibold)
+    private var pomoFont = NSFont.systemFont(ofSize: 18, weight: .semibold)
+    private var mailTitleFont = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
+    private var mailFromFont = NSFont.systemFont(ofSize: 7.5)
     private var wheelAccum: CGFloat = 0
 
     init(settings: Settings) {
         self.settings = settings
         super.init(frame: .zero)
         rebuildFonts()
+        pomoRemainSec = settings.pomodoroWorkMin * 60
     }
 
     required init?(coder: NSCoder) { nil }
@@ -641,22 +708,103 @@ final class WidgetView: NSView {
         labelFont = NSFont.systemFont(ofSize: 9 * k)
         valueFont = NSFont.systemFont(ofSize: 9.5 * k, weight: .semibold)
         smallFont = NSFont.systemFont(ofSize: 8 * k)
+        clockFont = NSFont.systemFont(ofSize: 22 * k, weight: .semibold)
+        pomoFont = NSFont.systemFont(ofSize: 18 * k, weight: .semibold)
+        mailTitleFont = NSFont.systemFont(ofSize: 9.5 * k, weight: .semibold)
+        mailFromFont = NSFont.systemFont(ofSize: 7.5 * k)
     }
 
     func S(_ v: CGFloat) -> CGFloat { (v * settings.fontScale).rounded() }
 
     func minContentSize() -> NSSize {
-        NSSize(width: S(Layout.minWidth), height: S(Layout.contentHeight(Layout.minGraphH)))
+        var w = Layout.minWidth
+        if settings.anySidePanel { w += Layout.panelGap + Layout.rightColMin }
+        let h: CGFloat
+        if settings.anySidePanel {
+            h = max(Layout.metricsContentHeight(Layout.minGraphH), Layout.sidePanelsMinHeight(settings: settings))
+        } else {
+            h = Layout.metricsContentHeight(Layout.minGraphH)
+        }
+        return NSSize(width: S(w), height: S(h))
     }
 
-    func defaultSize() -> NSSize {
-        NSSize(width: S(Layout.baseWidth), height: S(Layout.contentHeight(Layout.graphH)))
+    func preferredSize() -> NSSize {
+        var w = Layout.baseWidth
+        if settings.anySidePanel { w += Layout.panelGap + Layout.rightColMin }
+        let metrics = Layout.metricsContentHeight(Layout.graphH)
+        let side = settings.anySidePanel ? Layout.sidePanelsMinHeight(settings: settings) : metrics
+        return NSSize(width: S(w), height: S(max(metrics, side)))
+    }
+
+    func defaultSize() -> NSSize { preferredSize() }
+
+    func leftColWidth() -> CGFloat {
+        if !settings.anySidePanel { return bounds.width }
+        let gap = S(Layout.panelGap)
+        let minRight = S(Layout.rightColMin)
+        let maxLeft = max(S(Layout.minWidth), bounds.width - gap - minRight)
+        return max(S(Layout.minWidth), min(S(Layout.baseWidth), maxLeft))
     }
 
     func push(_ s: Snapshot) {
         snapshot = s
         append(&upHist, s.up)
         append(&downHist, s.down)
+        updatePomodoroRemain()
+        needsDisplay = true
+    }
+
+    func updatePomodoroRemain() {
+        if pomoPhase == 0 {
+            pomoRemainSec = settings.pomodoroWorkMin * 60
+            return
+        }
+        if pomoPaused { return }
+        let left = Int(ceil(pomoDeadline.timeIntervalSinceNow))
+        if left <= 0 {
+            if pomoPhase == 1 {
+                pomoPhase = 2
+                pomoDeadline = Date().addingTimeInterval(TimeInterval(settings.pomodoroBreakMin * 60))
+                pomoRemainSec = settings.pomodoroBreakMin * 60
+            } else {
+                pomoPhase = 1
+                pomoDeadline = Date().addingTimeInterval(TimeInterval(settings.pomodoroWorkMin * 60))
+                pomoRemainSec = settings.pomodoroWorkMin * 60
+            }
+        } else {
+            pomoRemainSec = left
+        }
+    }
+
+    func togglePomodoroRun() {
+        if !settings.showPomodoro { return }
+        if pomoPhase == 0 {
+            pomoPhase = 1
+            pomoPaused = false
+            pomoDeadline = Date().addingTimeInterval(TimeInterval(settings.pomodoroWorkMin * 60))
+            pomoRemainSec = settings.pomodoroWorkMin * 60
+        } else if pomoPaused {
+            pomoPaused = false
+            pomoDeadline = Date().addingTimeInterval(TimeInterval(max(1, pomoRemainSec)))
+        } else {
+            updatePomodoroRemain()
+            pomoPaused = true
+        }
+        needsDisplay = true
+    }
+
+    func resetPomodoro() {
+        pomoPhase = 0
+        pomoPaused = false
+        pomoRemainSec = settings.pomodoroWorkMin * 60
+        needsDisplay = true
+    }
+
+    func restartPomodoroPhase() {
+        let mins = pomoPhase == 2 ? settings.pomodoroBreakMin : settings.pomodoroWorkMin
+        pomoDeadline = Date().addingTimeInterval(TimeInterval(mins * 60))
+        pomoRemainSec = mins * 60
+        pomoPaused = false
         needsDisplay = true
     }
 
@@ -671,18 +819,35 @@ final class WidgetView: NSView {
         Palette.bg.setFill()
         bounds.fill()
 
+        let leftW = leftColWidth()
+        drawMetricsColumn(colW: leftW)
+        if settings.anySidePanel {
+            let sx = leftW + S(Layout.panelGap)
+            Palette.sep.setStroke()
+            let line = NSBezierPath()
+            let mid = leftW + S(Layout.panelGap) / 2
+            line.move(to: NSPoint(x: mid, y: S(Layout.pad)))
+            line.line(to: NSPoint(x: mid, y: bounds.height - S(Layout.pad)))
+            line.lineWidth = 1
+            line.stroke()
+            drawSideColumn(x: sx, w: max(0, bounds.width - sx))
+        }
+        drawGrip()
+    }
+
+    private func drawMetricsColumn(colW: CGFloat) {
         let s = snapshot ?? Snapshot()
         var y = S(Layout.pad)
+        let left = S(Layout.pad)
+        let right = colW - S(Layout.pad)
         let memDetail: String? = s.memTotal > 0
             ? String(format: "%.1f / %.1f GB", Double(s.memUsed) / 1073741824, Double(s.memTotal) / 1073741824)
             : nil
-        drawMetric("CPU", s.cpu, nil, Palette.cpu, &y)
-        drawMetric("MEM", s.mem, memDetail, Palette.mem, &y)
-        drawMetric("DISK", s.disk, nil, Palette.disk, &y)
-        drawMetric("GPU", s.gpu, nil, Palette.gpu, &y)
+        drawMetric(left: left, right: right, "CPU", s.cpu, nil, Palette.cpu, &y)
+        drawMetric(left: left, right: right, "MEM", s.mem, memDetail, Palette.mem, &y)
+        drawMetric(left: left, right: right, "DISK", s.disk, nil, Palette.disk, &y)
+        drawMetric(left: left, right: right, "GPU", s.gpu, nil, Palette.gpu, &y)
 
-        let left = S(Layout.pad)
-        let right = bounds.width - S(Layout.pad)
         let sepY = y + S(Layout.sepH) / 2 - S(Layout.rowGap) / 2
         Palette.sep.setStroke()
         let line = NSBezierPath()
@@ -706,21 +871,152 @@ final class WidgetView: NSView {
         drawString(status, font: smallFont, color: Palette.dim, x: 0, y: y + S(2), right: right)
         y += S(Layout.netHeaderH)
 
-        let half = (right - left) / 2
+        let half = max(0, (right - left) / 2)
         drawString("↓ " + Format.speed(s.down, bits: settings.bits), font: valueFont, color: Palette.down, x: left, y: y)
         drawString("↑ " + Format.speed(s.up, bits: settings.bits), font: valueFont, color: Palette.up, x: left + half, y: y)
         y += S(Layout.netSpeedH)
 
         let graphH = bounds.height - S(Layout.pad) - S(4) - y
-        if graphH > 2 {
+        if graphH > 2, right > left {
             drawGraph(NSRect(x: left, y: y, width: max(1, right - left), height: graphH))
         }
-        drawGrip()
     }
 
-    private func drawMetric(_ label: String, _ value: Double, _ detail: String?, _ accent: NSColor, _ y: inout CGFloat) {
-        let left = S(Layout.pad)
-        let right = bounds.width - S(Layout.pad)
+    private func drawSideColumn(x: CGFloat, w: CGFloat) {
+        var y = S(Layout.pad)
+        let left = x
+        let innerW = max(0, w - S(Layout.pad))
+        pomoToggleRect = .zero
+
+        if settings.showClock {
+            let ch = S(settings.clockAnalog ? Layout.clockAnalogH : Layout.clockDigitalH)
+            drawClock(NSRect(x: left, y: y, width: innerW, height: ch))
+            y += ch + S(8)
+        }
+        if settings.showPomodoro {
+            let ph = S(Layout.pomoH)
+            drawPomodoro(NSRect(x: left, y: y, width: innerW, height: ph))
+            y += ph + S(8)
+        }
+        if settings.showGmail {
+            let gh = bounds.height - S(Layout.pad) - y
+            if gh > S(Layout.gmailHeaderH) {
+                drawGmail(NSRect(x: left, y: y, width: innerW, height: gh))
+            }
+        }
+    }
+
+    private func drawClock(_ r: NSRect) {
+        let now = Date()
+        drawString("時計", font: smallFont, color: Palette.dim, x: r.minX, y: r.minY)
+        if settings.clockAnalog {
+            let size = min(r.width - S(8), r.height - S(18))
+            guard size >= 8 else { return }
+            let face = NSRect(x: r.minX + (r.width - size) / 2, y: r.minY + S(16), width: size, height: size)
+            Palette.grip.setStroke()
+            let circle = NSBezierPath(ovalIn: face)
+            circle.lineWidth = 1
+            circle.stroke()
+            let cx = face.midX, cy = face.midY, rad = face.width / 2
+            let cal = Calendar.current
+            let h = cal.component(.hour, from: now) % 12
+            let m = cal.component(.minute, from: now)
+            let s = cal.component(.second, from: now)
+            drawHand(cx: cx, cy: cy, length: rad * 0.55, deg: CGFloat(h) * 30 + CGFloat(m) * 0.5, width: 2.5, color: Palette.value)
+            drawHand(cx: cx, cy: cy, length: rad * 0.75, deg: CGFloat(m) * 6 + CGFloat(s) * 0.1, width: 2, color: Palette.value)
+            drawHand(cx: cx, cy: cy, length: rad * 0.85, deg: CGFloat(s) * 6, width: 1.2, color: Palette.high)
+        } else {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "ja_JP")
+            formatter.dateFormat = "HH:mm:ss"
+            let time = formatter.string(from: now)
+            formatter.dateFormat = "yyyy/MM/dd EEE"
+            let date = formatter.string(from: now)
+            let tw = (time as NSString).size(withAttributes: [.font: clockFont]).width
+            drawString(time, font: clockFont, color: Palette.value, x: r.minX + max(0, (r.width - tw) / 2), y: r.minY + S(14))
+            let dw = (date as NSString).size(withAttributes: [.font: smallFont]).width
+            drawString(date, font: smallFont, color: Palette.dim, x: r.minX + max(0, (r.width - dw) / 2), y: r.minY + S(40))
+        }
+    }
+
+    private func drawHand(cx: CGFloat, cy: CGFloat, length: CGFloat, deg: CGFloat, width: CGFloat, color: NSColor) {
+        let rad = (deg - 90) * .pi / 180
+        let tip = NSPoint(x: cx + cos(rad) * length, y: cy + sin(rad) * length)
+        let path = NSBezierPath()
+        path.lineWidth = width
+        path.lineCapStyle = .round
+        path.move(to: NSPoint(x: cx, y: cy))
+        path.line(to: tip)
+        color.setStroke()
+        path.stroke()
+    }
+
+    private func drawPomodoro(_ r: NSRect) {
+        updatePomodoroRemain()
+        let phase: String
+        switch pomoPhase {
+        case 1: phase = pomoPaused ? "作業 一時停止" : "作業中"
+        case 2: phase = pomoPaused ? "休憩 一時停止" : "休憩中"
+        default: phase = "停止"
+        }
+        drawString("ポモドーロ · \(phase)", font: smallFont, color: Palette.dim, x: r.minX, y: r.minY)
+        let mmss = String(format: "%02d:%02d", max(0, pomoRemainSec) / 60, max(0, pomoRemainSec) % 60)
+        let tw = (mmss as NSString).size(withAttributes: [.font: pomoFont]).width
+        drawString(mmss, font: pomoFont, color: Palette.value, x: r.minX + max(0, (r.width - tw) / 2), y: r.minY + S(16))
+
+        let btn = pomoPhase == 0 ? "開始" : (pomoPaused ? "再開" : "一時停止")
+        let bs = (btn as NSString).size(withAttributes: [.font: smallFont])
+        let bw = bs.width + S(16), bh = S(20)
+        pomoToggleRect = NSRect(x: r.minX + (r.width - bw) / 2, y: r.maxY - bh - S(2), width: bw, height: bh)
+        fillRound(pomoToggleRect, Palette.track)
+        drawString(btn, font: smallFont, color: Palette.value,
+                   x: pomoToggleRect.minX + (pomoToggleRect.width - bs.width) / 2,
+                   y: pomoToggleRect.minY + (pomoToggleRect.height - bs.height) / 2)
+    }
+
+    private func drawGmail(_ r: NSRect) {
+        drawString("Gmail", font: smallFont, color: Palette.dim, x: r.minX, y: r.minY)
+        if !gmailStatus.isEmpty {
+            let tip = ellipsize(gmailStatus, font: smallFont, maxWidth: r.width / 2)
+            drawString(tip, font: smallFont, color: Palette.dim, x: 0, y: r.minY, right: r.maxX)
+        }
+        var y = r.minY + S(Layout.gmailHeaderH)
+        let rowH = S(Layout.gmailRowH)
+        var shown = 0
+        for m in gmailItems {
+            guard y + rowH <= r.maxY else { break }
+            let from = ellipsize(m.from, font: mailFromFont, maxWidth: r.width)
+            let sub = ellipsize(m.subject, font: mailTitleFont, maxWidth: r.width)
+            drawString(from, font: mailFromFont, color: Palette.dim, x: r.minX, y: y)
+            drawString(sub, font: mailTitleFont, color: Palette.value, x: r.minX, y: y + S(12))
+            y += rowH
+            shown += 1
+        }
+        if shown == 0 {
+            let tip = gmailAuthorized ? "メールなし / 取得待ち" : "メニューから接続"
+            drawString(tip, font: smallFont, color: Palette.dim, x: r.minX, y: y)
+        }
+    }
+
+    private func ellipsize(_ text: String, font: NSFont, maxWidth: CGFloat) -> String {
+        if text.isEmpty || maxWidth <= 0 { return "" }
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        if (text as NSString).size(withAttributes: attrs).width <= maxWidth { return text }
+        let ell = "…"
+        var lo = 0, hi = text.count
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            let idx = text.index(text.startIndex, offsetBy: mid)
+            let candidate = String(text[..<idx]) + ell
+            if (candidate as NSString).size(withAttributes: attrs).width <= maxWidth { lo = mid }
+            else { hi = mid - 1 }
+        }
+        if lo <= 0 { return ell }
+        let idx = text.index(text.startIndex, offsetBy: lo)
+        return String(text[..<idx]) + ell
+    }
+
+    private func drawMetric(left: CGFloat, right: CGFloat, _ label: String, _ value: Double, _ detail: String?, _ accent: NSColor, _ y: inout CGFloat) {
         drawString(label, font: labelFont, color: Palette.label, x: left, y: y)
         let valueWidth = drawString(Format.percent(value), font: valueFont, color: Palette.value, x: 0, y: y - S(1), right: right)
         if let detail {
@@ -728,9 +1024,9 @@ final class WidgetView: NSView {
         }
         y += S(Layout.labelH)
 
-        let track = NSRect(x: left, y: y, width: max(1, right - left), height: max(1, S(Layout.barH)))
+        let track = NSRect(x: left, y: y, width: max(0, right - left), height: max(1, S(Layout.barH)))
         fillRound(track, Palette.track)
-        if value > 0 {
+        if value > 0, track.width > 0 {
             let shown = min(100, value)
             var fillW = track.width * CGFloat(shown) / 100
             fillW = min(track.width, max(track.height, fillW))
@@ -841,7 +1137,12 @@ final class WidgetView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard let window else { return }
-        let edges = hitEdges(convert(event.locationInWindow, from: nil))
+        let local = convert(event.locationInWindow, from: nil)
+        if settings.showPomodoro, pomoToggleRect.contains(local) {
+            togglePomodoroRun()
+            return
+        }
+        let edges = hitEdges(local)
         if edges.isEmpty {
             window.performDrag(with: event)
             onBoundsChanged?()
@@ -946,6 +1247,7 @@ enum StatusIcon {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = Settings.load()
     private let collector = MetricsCollector()
+    private let gmail = GmailClient()
     private var window: WidgetWindow?
     private var widget: WidgetView?
     private var statusItem: NSStatusItem?
@@ -954,14 +1256,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var opacityMenu: NSMenu?
     private var unitMenu: NSMenu?
     private var fontMenu: NSMenu?
+    private var workMenu: NSMenu?
+    private var breakMenu: NSMenu?
+    private var gmailCountMenu: NSMenu?
     private var topMostItem: NSMenuItem?
     private var autoStartItem: NSMenuItem?
     private var bitsItem: NSMenuItem?
     private var bytesItem: NSMenuItem?
+    private var clockShowItem: NSMenuItem?
+    private var clockDigitalItem: NSMenuItem?
+    private var clockAnalogItem: NSMenuItem?
+    private var pomoShowItem: NSMenuItem?
+    private var gmailShowItem: NSMenuItem?
     private var suppressStatusAction = false
+    private var gmailNextFetch = Date.distantPast
+    private var gmailFetching = false
+    private var metricsTick = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        gmail.loadStoredToken()
         let view = WidgetView(settings: settings)
+        view.gmailAuthorized = gmail.isAuthorized
         view.onBoundsChanged = { [weak self] in self?.saveBounds() }
         view.onStepFont = { [weak self] dir in self?.stepFont(dir) }
 
@@ -990,11 +1305,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.orderFrontRegardless()
         saveBounds()
 
-        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
         tick()
+        if settings.showGmail { ensureGmailFetch(force: true) }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1005,10 +1322,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     private func tick() {
-        let snap = collector.sample()
-        widget?.push(snap)
-        let tip = "CPU \(Format.percent(snap.cpu))  MEM \(Format.percent(snap.mem))  GPU \(Format.percent(snap.gpu))"
-        statusItem?.button?.toolTip = String(tip.prefix(120))
+        metricsTick += 1
+        if metricsTick >= 4 {
+            metricsTick = 0
+            let snap = collector.sample()
+            widget?.push(snap)
+            let tip = "CPU \(Format.percent(snap.cpu))  MEM \(Format.percent(snap.mem))  GPU \(Format.percent(snap.gpu))"
+            statusItem?.button?.toolTip = String(tip.prefix(120))
+        } else if settings.showClock || settings.showPomodoro {
+            widget?.updatePomodoroRemain()
+            widget?.needsDisplay = true
+        }
+        if settings.showGmail { ensureGmailFetch(force: false) }
+    }
+
+    private func ensureSideWidth() {
+        guard let window, let widget else { return }
+        let min = widget.minContentSize()
+        var frame = window.frame
+        var changed = false
+        if frame.width < min.width {
+            frame.size.width = min.width
+            changed = true
+        }
+        if frame.height < min.height {
+            let top = frame.maxY
+            frame.size.height = min.height
+            frame.origin.y = top - min.height
+            changed = true
+        }
+        if changed {
+            window.minSize = min
+            window.setFrame(frame, display: true)
+            saveBounds()
+        } else {
+            window.minSize = min
+        }
+        widget.needsDisplay = true
     }
 
     private func installStatusItem(menu: NSMenu) {
@@ -1090,7 +1440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let old = settings.fontScale
         if abs(scale - old) < 0.001 { return }
         guard let window, let widget else { return }
-        let oldExtra = max(0, window.frame.height - widget.S(Layout.contentHeight(Layout.graphH)))
+        let oldExtra = max(0, window.frame.height - widget.preferredSize().height)
         let ratio = scale / old
         let newW = (window.frame.width * ratio).rounded()
         let screen = window.screen ?? NSScreen.main
@@ -1100,9 +1450,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.fontScale = scale
         widget.rebuildFonts()
         let minSize = widget.minContentSize()
+        let preferred = widget.preferredSize()
         let size = NSSize(
             width: max(minSize.width, newW),
-            height: max(minSize.height, widget.S(Layout.contentHeight(Layout.graphH)) + (oldExtra * ratio).rounded()))
+            height: max(minSize.height, preferred.height + (oldExtra * ratio).rounded()))
         var origin = NSPoint(x: window.frame.origin.x, y: top - size.height)
         if anchorRight { origin.x = right - size.width }
         window.minSize = minSize
@@ -1184,6 +1535,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let unitItem = NSMenuItem(title: "速度の単位", action: nil, keyEquivalent: "")
         unitItem.submenu = unit
 
+        let clockMenu = NSMenu(title: "時計")
+        clockMenu.autoenablesItems = false
+        clockMenu.delegate = self
+        let clockShow = NSMenuItem(title: "表示する", action: #selector(toggleClock), keyEquivalent: "")
+        clockShow.target = self
+        clockShowItem = clockShow
+        let clockDigital = NSMenuItem(title: "デジタル", action: #selector(setClockDigital), keyEquivalent: "")
+        clockDigital.target = self
+        clockDigitalItem = clockDigital
+        let clockAnalog = NSMenuItem(title: "アナログ", action: #selector(setClockAnalog), keyEquivalent: "")
+        clockAnalog.target = self
+        clockAnalogItem = clockAnalog
+        clockMenu.addItem(clockShow)
+        clockMenu.addItem(.separator())
+        clockMenu.addItem(clockDigital)
+        clockMenu.addItem(clockAnalog)
+        let clockItem = NSMenuItem(title: "時計", action: nil, keyEquivalent: "")
+        clockItem.submenu = clockMenu
+
+        let pomoMenu = NSMenu(title: "ポモドーロ")
+        pomoMenu.autoenablesItems = false
+        pomoMenu.delegate = self
+        let pomoShow = NSMenuItem(title: "表示する", action: #selector(togglePomodoroPanel), keyEquivalent: "")
+        pomoShow.target = self
+        pomoShowItem = pomoShow
+        let pomoStart = NSMenuItem(title: "開始 / 一時停止", action: #selector(pomoStartPause), keyEquivalent: "")
+        pomoStart.target = self
+        let pomoResetItem = NSMenuItem(title: "リセット", action: #selector(pomoReset), keyEquivalent: "")
+        pomoResetItem.target = self
+        let work = NSMenu(title: "作業時間")
+        work.autoenablesItems = false
+        work.delegate = self
+        for m in Layout.workMins {
+            let item = NSMenuItem(title: "\(m) 分", action: #selector(setWorkMin(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = m
+            work.addItem(item)
+        }
+        workMenu = work
+        let workItem = NSMenuItem(title: "作業時間", action: nil, keyEquivalent: "")
+        workItem.submenu = work
+        let brk = NSMenu(title: "休憩時間")
+        brk.autoenablesItems = false
+        brk.delegate = self
+        for m in Layout.breakMins {
+            let item = NSMenuItem(title: "\(m) 分", action: #selector(setBreakMin(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = m
+            brk.addItem(item)
+        }
+        breakMenu = brk
+        let breakItem = NSMenuItem(title: "休憩時間", action: nil, keyEquivalent: "")
+        breakItem.submenu = brk
+        pomoMenu.addItem(pomoShow)
+        pomoMenu.addItem(.separator())
+        pomoMenu.addItem(pomoStart)
+        pomoMenu.addItem(pomoResetItem)
+        pomoMenu.addItem(workItem)
+        pomoMenu.addItem(breakItem)
+        let pomoItem = NSMenuItem(title: "ポモドーロ", action: nil, keyEquivalent: "")
+        pomoItem.submenu = pomoMenu
+
+        let gmailMenu = NSMenu(title: "Gmail")
+        gmailMenu.autoenablesItems = false
+        gmailMenu.delegate = self
+        let gmailShow = NSMenuItem(title: "表示する", action: #selector(toggleGmail), keyEquivalent: "")
+        gmailShow.target = self
+        gmailShowItem = gmailShow
+        let gmailConnect = NSMenuItem(title: "接続…", action: #selector(gmailConnect), keyEquivalent: "")
+        gmailConnect.target = self
+        let gmailDisconnect = NSMenuItem(title: "切断", action: #selector(gmailDisconnect), keyEquivalent: "")
+        gmailDisconnect.target = self
+        let gmailCred = NSMenuItem(title: "Client ID を設定…", action: #selector(gmailEditCredentials), keyEquivalent: "")
+        gmailCred.target = self
+        let gmailRefresh = NSMenuItem(title: "今すぐ更新", action: #selector(gmailRefreshNow), keyEquivalent: "")
+        gmailRefresh.target = self
+        let countMenu = NSMenu(title: "表示件数")
+        countMenu.autoenablesItems = false
+        countMenu.delegate = self
+        for n in 3...10 {
+            let item = NSMenuItem(title: "\(n) 件", action: #selector(setGmailCount(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = n
+            countMenu.addItem(item)
+        }
+        gmailCountMenu = countMenu
+        let countItem = NSMenuItem(title: "表示件数", action: nil, keyEquivalent: "")
+        countItem.submenu = countMenu
+        gmailMenu.addItem(gmailShow)
+        gmailMenu.addItem(.separator())
+        gmailMenu.addItem(gmailConnect)
+        gmailMenu.addItem(gmailDisconnect)
+        gmailMenu.addItem(gmailCred)
+        gmailMenu.addItem(gmailRefresh)
+        gmailMenu.addItem(countItem)
+        let gmailItem = NSMenuItem(title: "Gmail", action: nil, keyEquivalent: "")
+        gmailItem.submenu = gmailMenu
+
         let auto = NSMenuItem(title: "ログイン時に自動起動", action: #selector(toggleAutoStart), keyEquivalent: "")
         auto.target = self
         auto.state = AutoStart.isEnabled() ? .on : .off
@@ -1198,6 +1647,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(opacityItem)
         menu.addItem(fontItem)
         menu.addItem(unitItem)
+        menu.addItem(clockItem)
+        menu.addItem(pomoItem)
+        menu.addItem(gmailItem)
         menu.addItem(auto)
         menu.addItem(reset)
         menu.addItem(.separator())
@@ -1218,10 +1670,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if menu === unitMenu {
             bitsItem?.state = settings.bits ? .on : .off
             bytesItem?.state = settings.bits ? .off : .on
+        } else if menu === workMenu {
+            for item in menu.items { item.state = item.tag == settings.pomodoroWorkMin ? .on : .off }
+        } else if menu === breakMenu {
+            for item in menu.items { item.state = item.tag == settings.pomodoroBreakMin ? .on : .off }
+        } else if menu === gmailCountMenu {
+            for item in menu.items { item.state = item.tag == settings.gmailCount ? .on : .off }
         } else if menu === rootMenu {
             topMostItem?.state = settings.topMost ? .on : .off
             autoStartItem?.state = AutoStart.isEnabled() ? .on : .off
         }
+        clockShowItem?.state = settings.showClock ? .on : .off
+        clockDigitalItem?.state = settings.clockAnalog ? .off : .on
+        clockAnalogItem?.state = settings.clockAnalog ? .on : .off
+        pomoShowItem?.state = settings.showPomodoro ? .on : .off
+        gmailShowItem?.state = settings.showGmail ? .on : .off
     }
 
     @objc private func toggleTopMost() {
@@ -1271,7 +1734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func resetPosition() {
         guard let window, let widget else { return }
-        let size = widget.defaultSize()
+        let size = widget.preferredSize()
         let vf = (window.screen ?? NSScreen.main)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
         let frame = NSRect(
@@ -1284,15 +1747,164 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         saveBounds()
     }
 
+    @objc private func toggleClock() {
+        settings.showClock.toggle()
+        settings.save()
+        ensureSideWidth()
+    }
+
+    @objc private func setClockDigital() {
+        settings.clockAnalog = false
+        settings.save()
+        ensureSideWidth()
+    }
+
+    @objc private func setClockAnalog() {
+        settings.clockAnalog = true
+        settings.save()
+        ensureSideWidth()
+    }
+
+    @objc private func togglePomodoroPanel() {
+        settings.showPomodoro.toggle()
+        if !settings.showPomodoro { widget?.resetPomodoro() }
+        settings.save()
+        ensureSideWidth()
+    }
+
+    @objc private func pomoStartPause() { widget?.togglePomodoroRun() }
+    @objc private func pomoReset() { widget?.resetPomodoro() }
+
+    @objc private func setWorkMin(_ sender: NSMenuItem) {
+        settings.pomodoroWorkMin = sender.tag
+        settings.save()
+        if widget?.pomoPhase == 1, widget?.pomoPaused == false {
+            widget?.restartPomodoroPhase()
+        }
+    }
+
+    @objc private func setBreakMin(_ sender: NSMenuItem) {
+        settings.pomodoroBreakMin = sender.tag
+        settings.save()
+        if widget?.pomoPhase == 2, widget?.pomoPaused == false {
+            widget?.restartPomodoroPhase()
+        }
+    }
+
+    @objc private func toggleGmail() {
+        settings.showGmail.toggle()
+        settings.save()
+        ensureSideWidth()
+        if settings.showGmail { ensureGmailFetch(force: true) }
+    }
+
+    @objc private func gmailConnect() {
+        if settings.gmailClientId.isEmpty {
+            gmailEditCredentials()
+            if settings.gmailClientId.isEmpty { return }
+        }
+        widget?.gmailStatus = "ブラウザで認証中…"
+        widget?.needsDisplay = true
+        let cid = settings.gmailClientId
+        let secret = settings.gmailClientSecret
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let ok = self.gmail.authorizeInteractive(clientId: cid, clientSecret: secret)
+            DispatchQueue.main.async {
+                self.widget?.gmailAuthorized = self.gmail.isAuthorized
+                self.widget?.gmailStatus = ok ? "接続済み" : (self.gmail.lastError.isEmpty ? "認証失敗" : self.gmail.lastError)
+                self.widget?.needsDisplay = true
+                if ok { self.ensureGmailFetch(force: true) }
+            }
+        }
+    }
+
+    @objc private func gmailDisconnect() {
+        gmail.clearTokens()
+        widget?.gmailItems = []
+        widget?.gmailAuthorized = false
+        widget?.gmailStatus = "未接続"
+        widget?.needsDisplay = true
+    }
+
+    @objc private func gmailEditCredentials() {
+        let alert = NSAlert()
+        alert.messageText = "Gmail OAuth 設定"
+        alert.informativeText = "Google Cloud で Desktop アプリの OAuth クライアントを作成して入力してください。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        let width: CGFloat = 360
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 6
+        stack.frame = NSRect(x: 0, y: 0, width: width, height: 64)
+        let idField = NSTextField(string: settings.gmailClientId)
+        idField.placeholderString = "Client ID"
+        let secretField = NSTextField(string: settings.gmailClientSecret)
+        secretField.placeholderString = "Client Secret（任意）"
+        stack.addArrangedSubview(idField)
+        stack.addArrangedSubview(secretField)
+        alert.accessoryView = stack
+        if alert.runModal() == .alertFirstButtonReturn {
+            settings.gmailClientId = idField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            settings.gmailClientSecret = secretField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            settings.save()
+        }
+    }
+
+    @objc private func gmailRefreshNow() { ensureGmailFetch(force: true) }
+
+    @objc private func setGmailCount(_ sender: NSMenuItem) {
+        settings.gmailCount = sender.tag
+        settings.save()
+        ensureSideWidth()
+        ensureGmailFetch(force: true)
+    }
+
+    private func ensureGmailFetch(force: Bool) {
+        guard settings.showGmail else { return }
+        if !gmail.isAuthorized {
+            widget?.gmailAuthorized = false
+            widget?.gmailStatus = "未接続"
+            return
+        }
+        if !force, Date() < gmailNextFetch { return }
+        if gmailFetching { return }
+        gmailFetching = true
+        gmailNextFetch = Date().addingTimeInterval(60)
+        widget?.gmailStatus = "更新中…"
+        widget?.needsDisplay = true
+        let cid = settings.gmailClientId
+        let secret = settings.gmailClientSecret
+        let count = settings.gmailCount
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let ok = self.gmail.refreshInbox(clientId: cid, clientSecret: secret, count: count)
+            let items = self.gmail.snapshot()
+            let err = self.gmail.lastError
+            DispatchQueue.main.async {
+                self.gmailFetching = false
+                self.widget?.gmailAuthorized = self.gmail.isAuthorized
+                if ok {
+                    self.widget?.gmailItems = items
+                    self.widget?.gmailStatus = ""
+                } else {
+                    self.widget?.gmailStatus = err.isEmpty ? "取得失敗" : err
+                }
+                self.widget?.needsDisplay = true
+            }
+        }
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 }
 
-private var keepAlive: AppDelegate?
+var keepAlive: AppDelegate?
 private var instanceLockFD: Int32 = -1
 
-private func acquireInstanceLock() -> Bool {
+func acquireInstanceLock() -> Bool {
     let dir = Settings.supportDirectory()
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1517,16 +2129,3 @@ enum SelfTest {
         return false
     }
 }
-
-if CommandLine.arguments.contains("--selftest") {
-    exit(SelfTest.run())
-}
-if !acquireInstanceLock() {
-    exit(0)
-}
-let application = NSApplication.shared
-application.setActivationPolicy(.accessory)
-let delegate = AppDelegate()
-keepAlive = delegate
-application.delegate = delegate
-application.run()
