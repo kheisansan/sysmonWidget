@@ -523,6 +523,65 @@ namespace SysmonWidget
         }
     }
 
+    /// <summary>
+    /// OAuth の Client ID / Secret。settings.ini ではなく Credential Manager に置く。
+    /// </summary>
+    static class GmailAppCredentials
+    {
+        const string Target = "SysmonWidget:GmailOAuthClient";
+
+        public static void Save(string clientId, string clientSecret)
+        {
+            var t = new ClientPayload();
+            t.client_id = clientId ?? "";
+            t.client_secret = clientSecret ?? "";
+            CredStore.Write(Target, Encode(t));
+        }
+
+        public static void Load(out string clientId, out string clientSecret)
+        {
+            clientId = "";
+            clientSecret = "";
+            string json = CredStore.Read(Target);
+            if (string.IsNullOrEmpty(json)) return;
+            try
+            {
+                ClientPayload t = Decode(json);
+                if (t == null) return;
+                clientId = t.client_id ?? "";
+                clientSecret = t.client_secret ?? "";
+            }
+            catch { }
+        }
+
+        public static void Delete()
+        {
+            CredStore.Delete(Target);
+        }
+
+        static string Encode(ClientPayload t)
+        {
+            using (var ms = new MemoryStream())
+            {
+                new DataContractJsonSerializer(typeof(ClientPayload)).WriteObject(ms, t);
+                return Encoding.UTF8.GetString(ms.ToArray());
+            }
+        }
+
+        static ClientPayload Decode(string json)
+        {
+            using (var ms = new MemoryStream(Encoding.UTF8.GetBytes(json)))
+                return new DataContractJsonSerializer(typeof(ClientPayload)).ReadObject(ms) as ClientPayload;
+        }
+
+        [DataContract]
+        class ClientPayload
+        {
+            [DataMember] public string client_id;
+            [DataMember] public string client_secret;
+        }
+    }
+
     static class CredStore
     {
         const int CredTypeGeneric = 1;

@@ -277,8 +277,6 @@ namespace SysmonWidget
         public bool ShowGmail;
         public int GmailCount = 5;
         public int GmailIntervalSec = 60; // 更新間隔（秒）
-        public string GmailClientId = "";
-        public string GmailClientSecret = "";
 
         static string FilePath
         {
@@ -335,13 +333,51 @@ namespace SysmonWidget
                         case "GmailIntervalSec":
                             if (int.TryParse(v, out i) && i >= 15 && i <= 3600) s.GmailIntervalSec = i;
                             break;
-                        case "GmailClientId": s.GmailClientId = v; break;
-                        case "GmailClientSecret": s.GmailClientSecret = v; break;
+                        // 旧版で ini に平文保存していた分は Credential Manager へ移す
+                        case "GmailClientId":
+                        case "GmailClientSecret":
+                            break;
                     }
                 }
+                if (MigratePlainGmailCredentials())
+                    s.Save(); // ini から平文キーを落とす
             }
             catch { }
             return s;
+        }
+
+        // 以前の settings.ini の Client ID / Secret を Credential Manager に移す。要再保存なら true。
+        static bool MigratePlainGmailCredentials()
+        {
+            try
+            {
+                if (!File.Exists(FilePath)) return false;
+                string id = null, secret = null;
+                bool hadPlain = false;
+                foreach (string line in File.ReadAllLines(FilePath))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
+                    if (k == "GmailClientId")
+                    {
+                        hadPlain = true;
+                        if (v.Length > 0) id = v;
+                    }
+                    else if (k == "GmailClientSecret")
+                    {
+                        hadPlain = true;
+                        secret = v;
+                    }
+                }
+                if (!hadPlain) return false;
+                string existingId, existingSecret;
+                GmailAppCredentials.Load(out existingId, out existingSecret);
+                if (string.IsNullOrEmpty(existingId) && !string.IsNullOrEmpty(id))
+                    GmailAppCredentials.Save(id, secret ?? "");
+                return true;
+            }
+            catch { return false; }
         }
 
         public void Save()
@@ -362,9 +398,7 @@ namespace SysmonWidget
                     "PomodoroBreakMin=" + PomodoroBreakMin,
                     "ShowGmail=" + ShowGmail,
                     "GmailCount=" + GmailCount,
-                    "GmailIntervalSec=" + GmailIntervalSec,
-                    "GmailClientId=" + GmailClientId,
-                    "GmailClientSecret=" + GmailClientSecret
+                    "GmailIntervalSec=" + GmailIntervalSec
                 });
             }
             catch { }
@@ -1031,42 +1065,50 @@ namespace SysmonWidget
 
         void EditGmailCredentials()
         {
+            string curId, curSecret;
+            GmailAppCredentials.Load(out curId, out curSecret);
             using (var dlg = new Form())
             {
                 dlg.Text = "Gmail OAuth 設定";
                 dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
                 dlg.StartPosition = FormStartPosition.CenterScreen;
-                dlg.ClientSize = new Size(440, 160);
+                dlg.ClientSize = new Size(440, 176);
                 dlg.MaximizeBox = false;
                 dlg.MinimizeBox = false;
                 dlg.ShowInTaskbar = false;
                 var l1 = new Label { Text = "Client ID", Left = 12, Top = 16, Width = 100 };
-                var t1 = new TextBox { Left = 120, Top = 12, Width = 300, Text = settings.GmailClientId };
+                var t1 = new TextBox { Left = 120, Top = 12, Width = 300, Text = curId };
                 var l2 = new Label { Text = "Client Secret", Left = 12, Top = 52, Width = 100 };
-                var t2 = new TextBox { Left = 120, Top = 48, Width = 300, Text = settings.GmailClientSecret };
+                var t2 = new TextBox { Left = 120, Top = 48, Width = 300, Text = curSecret };
                 var tip = new Label
                 {
-                    Left = 12, Top = 84, Width = 410, Height = 28,
-                    Text = "Google Cloud で Desktop アプリの OAuth クライアントを作成して入力"
+                    Left = 12, Top = 84, Width = 410, Height = 40,
+                    Text = "Google Cloud の Desktop OAuth クライアントを入力。\nCredential Manager に保存します（settings.ini には書きません）。"
                 };
-                var ok = new Button { Text = "保存", DialogResult = DialogResult.OK, Left = 250, Top = 120, Width = 80 };
-                var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 340, Top = 120, Width = 80 };
+                var ok = new Button { Text = "保存", DialogResult = DialogResult.OK, Left = 250, Top = 136, Width = 80 };
+                var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 340, Top = 136, Width = 80 };
                 dlg.Controls.AddRange(new Control[] { l1, t1, l2, t2, tip, ok, cancel });
                 dlg.AcceptButton = ok;
                 dlg.CancelButton = cancel;
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                settings.GmailClientId = (t1.Text ?? "").Trim();
-                settings.GmailClientSecret = (t2.Text ?? "").Trim();
+                string id = (t1.Text ?? "").Trim();
+                string secret = (t2.Text ?? "").Trim();
+                if (string.IsNullOrEmpty(id)) GmailAppCredentials.Delete();
+                else GmailAppCredentials.Save(id, secret);
+                // 旧 ini の平文を消す
                 settings.Save();
             }
         }
 
         void BeginGmailAuth()
         {
-            if (string.IsNullOrEmpty(settings.GmailClientId))
+            string cid, secret;
+            GmailAppCredentials.Load(out cid, out secret);
+            if (string.IsNullOrEmpty(cid))
             {
                 EditGmailCredentials();
-                if (string.IsNullOrEmpty(settings.GmailClientId)) return;
+                GmailAppCredentials.Load(out cid, out secret);
+                if (string.IsNullOrEmpty(cid)) return;
             }
             if (gmailAuthCancel != null)
             {
@@ -1075,8 +1117,6 @@ namespace SysmonWidget
             gmailAuthCancel = new CancellationTokenSource();
             gmailStatus = "ブラウザで認証中…";
             Invalidate();
-            string cid = settings.GmailClientId;
-            string secret = settings.GmailClientSecret;
             CancellationToken token = gmailAuthCancel.Token;
             ThreadPool.QueueUserWorkItem(_ =>
             {
@@ -1113,8 +1153,8 @@ namespace SysmonWidget
             int interval = Math.Max(15, Math.Min(3600, settings.GmailIntervalSec));
             gmailNextFetchUtc = DateTime.UtcNow.AddSeconds(interval);
             gmailStatus = "更新中…";
-            string cid = settings.GmailClientId;
-            string secret = settings.GmailClientSecret;
+            string cid, secret;
+            GmailAppCredentials.Load(out cid, out secret);
             int count = settings.GmailCount;
             gmailWorker = new Thread(() =>
             {

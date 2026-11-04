@@ -147,8 +147,6 @@ final class Settings {
     var showGmail = false
     var gmailCount = 5
     var gmailIntervalSec = 60
-    var gmailClientId = ""
-    var gmailClientSecret = ""
 
     var anySidePanel: Bool { showClock || showPomodoro || showGmail }
 
@@ -194,12 +192,42 @@ final class Settings {
                 if let n = Int(value), (3...10).contains(n) { s.gmailCount = n }
             case "GmailIntervalSec":
                 if let n = Int(value), (15...3600).contains(n) { s.gmailIntervalSec = n }
-            case "GmailClientId": s.gmailClientId = String(value)
-            case "GmailClientSecret": s.gmailClientSecret = String(value)
+            case "GmailClientId", "GmailClientSecret":
+                break // 旧平文キーは migratePlainGmailCredentials で Keychain へ
             default: break
             }
         }
+        if migratePlainGmailCredentials(from: url) {
+            s.save(to: url)
+        }
         return s
+    }
+
+    /// 旧 settings.ini の Client ID / Secret を Keychain へ移す。再保存が必要なら true。
+    private static func migratePlainGmailCredentials(from url: URL) -> Bool {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        var id: String?
+        var secret: String?
+        var hadPlain = false
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if key == "GmailClientId" {
+                hadPlain = true
+                if !value.isEmpty { id = value }
+            } else if key == "GmailClientSecret" {
+                hadPlain = true
+                secret = value
+            }
+        }
+        guard hadPlain else { return false }
+        let existing = GmailAppCredentials.load()
+        if existing.clientId.isEmpty, let id, !id.isEmpty {
+            GmailAppCredentials.save(clientId: id, clientSecret: secret ?? "")
+        }
+        return true
     }
 
     func save(to url: URL = fileURL()) {
@@ -220,8 +248,6 @@ final class Settings {
         lines.append("ShowGmail=\(showGmail)")
         lines.append("GmailCount=\(gmailCount)")
         lines.append("GmailIntervalSec=\(gmailIntervalSec)")
-        lines.append("GmailClientId=\(gmailClientId)")
-        lines.append("GmailClientSecret=\(gmailClientSecret)")
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try lines.joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
@@ -1820,14 +1846,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func gmailConnect() {
-        if settings.gmailClientId.isEmpty {
+        var creds = GmailAppCredentials.load()
+        if creds.clientId.isEmpty {
             gmailEditCredentials()
-            if settings.gmailClientId.isEmpty { return }
+            creds = GmailAppCredentials.load()
+            if creds.clientId.isEmpty { return }
         }
         widget?.gmailStatus = "ブラウザで認証中…"
         widget?.needsDisplay = true
-        let cid = settings.gmailClientId
-        let secret = settings.gmailClientSecret
+        let cid = creds.clientId
+        let secret = creds.clientSecret
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let ok = self.gmail.authorizeInteractive(clientId: cid, clientSecret: secret)
@@ -1849,9 +1877,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func gmailEditCredentials() {
+        let current = GmailAppCredentials.load()
         let alert = NSAlert()
         alert.messageText = "Gmail OAuth 設定"
-        alert.informativeText = "Google Cloud で Desktop アプリの OAuth クライアントを作成して入力してください。"
+        alert.informativeText = "Google Cloud の Desktop OAuth クライアントを入力してください。Keychain に保存します（settings.ini には書きません）。"
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
         let width: CGFloat = 360
@@ -1859,17 +1888,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stack.orientation = .vertical
         stack.spacing = 6
         stack.frame = NSRect(x: 0, y: 0, width: width, height: 64)
-        let idField = NSTextField(string: settings.gmailClientId)
+        let idField = NSTextField(string: current.clientId)
         idField.placeholderString = "Client ID"
-        let secretField = NSTextField(string: settings.gmailClientSecret)
+        let secretField = NSTextField(string: current.clientSecret)
         secretField.placeholderString = "Client Secret（任意）"
         stack.addArrangedSubview(idField)
         stack.addArrangedSubview(secretField)
         alert.accessoryView = stack
         if alert.runModal() == .alertFirstButtonReturn {
-            settings.gmailClientId = idField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            settings.gmailClientSecret = secretField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            settings.save()
+            let id = idField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let secret = secretField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if id.isEmpty { GmailAppCredentials.delete() }
+            else { GmailAppCredentials.save(clientId: id, clientSecret: secret) }
+            settings.save() // 旧 ini の平文キーを落とす
         }
     }
 
@@ -1909,12 +1940,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gmailNextFetch = Date().addingTimeInterval(TimeInterval(interval))
         widget?.gmailStatus = "更新中…"
         widget?.needsDisplay = true
-        let cid = settings.gmailClientId
-        let secret = settings.gmailClientSecret
+        let creds = GmailAppCredentials.load()
         let count = settings.gmailCount
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let ok = self.gmail.refreshInbox(clientId: cid, clientSecret: secret, count: count)
+            let ok = self.gmail.refreshInbox(clientId: creds.clientId, clientSecret: creds.clientSecret, count: count)
             let items = self.gmail.snapshot()
             let err = self.gmail.lastError
             DispatchQueue.main.async {

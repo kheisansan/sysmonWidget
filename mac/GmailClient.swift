@@ -301,7 +301,7 @@ final class GmailClient {
     }
 }
 
-private enum Keychain {
+enum Keychain {
     static func set(_ data: Data, service: String, account: String) {
         delete(service: service, account: account)
         let query: [String: Any] = [
@@ -335,6 +335,33 @@ private enum Keychain {
             kSecAttrAccount as String: account
         ]
         SecItemDelete(query as CFDictionary)
+    }
+}
+
+/// OAuth の Client ID / Secret。settings.ini ではなく Keychain に置く。
+enum GmailAppCredentials {
+    private static let service = "com.sysmonwidget.mac.gmail"
+    private static let account = "oauth-client"
+
+    static func save(clientId: String, clientSecret: String) {
+        let obj: [String: String] = [
+            "client_id": clientId,
+            "client_secret": clientSecret
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        Keychain.set(data, service: service, account: account)
+    }
+
+    static func load() -> (clientId: String, clientSecret: String) {
+        guard let data = Keychain.get(service: service, account: account),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ("", "")
+        }
+        return (obj["client_id"] as? String ?? "", obj["client_secret"] as? String ?? "")
+    }
+
+    static func delete() {
+        Keychain.delete(service: service, account: account)
     }
 }
 
