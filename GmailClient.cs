@@ -20,7 +20,7 @@ namespace SysmonWidget
 
     /// <summary>
     /// Gmail API (readonly) + デスクトップ OAuth (PKCE)。
-    /// Client ID / Secret はユーザーが Google Cloud で作って settings に入れる。
+    /// Client ID / Secret とトークンは Credential Manager（DPAPI 保護）に保存する。
     /// </summary>
     sealed class GmailClient
     {
@@ -121,6 +121,7 @@ namespace SysmonWidget
             }
 
             string redirect = "http://127.0.0.1:" + port + "/";
+            string state = MakeVerifier();
             string url = AuthEndpoint
                 + "?client_id=" + Uri.EscapeDataString(clientId)
                 + "&redirect_uri=" + Uri.EscapeDataString(redirect)
@@ -128,6 +129,7 @@ namespace SysmonWidget
                 + "&scope=" + Uri.EscapeDataString(Scope)
                 + "&access_type=offline"
                 + "&prompt=consent"
+                + "&state=" + Uri.EscapeDataString(state)
                 + "&code_challenge=" + Uri.EscapeDataString(challenge)
                 + "&code_challenge_method=S256";
 
@@ -164,11 +166,18 @@ namespace SysmonWidget
                         string q = qmark >= 0 ? pathQuery.Substring(qmark) : "";
                         code = QueryValue(q, "code");
                         string err = QueryValue(q, "error");
-                        string html = "<html><body style='font-family:sans-serif;padding:24px'>"
-                            + (string.IsNullOrEmpty(code)
-                                ? ("認証に失敗しました: " + (err ?? "unknown"))
-                                : "認証できました。このタブを閉じてウィジェットに戻ってください。")
-                            + "</body></html>";
+                        string gotState = QueryValue(q, "state");
+                        bool stateOk = string.Equals(state, gotState, StringComparison.Ordinal);
+                        string msg;
+                        if (!string.IsNullOrEmpty(err))
+                            msg = "認証に失敗しました: " + HtmlEncode(err);
+                        else if (!stateOk)
+                            msg = "認証に失敗しました: state が一致しません";
+                        else if (string.IsNullOrEmpty(code))
+                            msg = "認証に失敗しました: 認可コードがありません";
+                        else
+                            msg = "認証できました。このタブを閉じてウィジェットに戻ってください。";
+                        string html = "<html><body style='font-family:sans-serif;padding:24px'>" + msg + "</body></html>";
                         byte[] body = Encoding.UTF8.GetBytes(html);
                         string header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "
                             + body.Length + "\r\nConnection: close\r\n\r\n";
@@ -177,7 +186,12 @@ namespace SysmonWidget
                         ns.Write(body, 0, body.Length);
                         if (!string.IsNullOrEmpty(err))
                         {
-                            SetError("認証エラー: " + err);
+                            SetError("認証エラー: " + Trunc(err, 120));
+                            code = null;
+                        }
+                        else if (!stateOk)
+                        {
+                            SetError("認証エラー: state が一致しません");
                             code = null;
                         }
                     }
@@ -401,6 +415,13 @@ namespace SysmonWidget
             return s.Substring(0, max) + "…";
         }
 
+        static string HtmlEncode(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+                .Replace("\"", "&quot;").Replace("'", "&#39;");
+        }
+
         void SetError(string msg)
         {
             lock (gate) lastError = msg ?? "";
@@ -585,7 +606,9 @@ namespace SysmonWidget
     static class CredStore
     {
         const int CredTypeGeneric = 1;
+        // このユーザーのログオン間で永続（同一マシン）。中身は DPAPI CurrentUser で保護する。
         const int CredPersistLocalMachine = 2;
+        static readonly byte[] DpapiEntropy = Encoding.UTF8.GetBytes("SysmonWidget.Gmail.v1");
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         struct CREDENTIAL
@@ -618,7 +641,8 @@ namespace SysmonWidget
 
         public static void Write(string target, string value)
         {
-            byte[] bytes = Encoding.UTF8.GetBytes(value ?? "");
+            byte[] plain = Encoding.UTF8.GetBytes(value ?? "");
+            byte[] bytes = Protect(plain);
             IntPtr blob = Marshal.AllocHGlobal(bytes.Length);
             try
             {
@@ -646,7 +670,8 @@ namespace SysmonWidget
                 if (c.CredentialBlob == IntPtr.Zero || c.CredentialBlobSize <= 0) return null;
                 var bytes = new byte[c.CredentialBlobSize];
                 Marshal.Copy(c.CredentialBlob, bytes, 0, bytes.Length);
-                return Encoding.UTF8.GetString(bytes);
+                byte[] plain = UnprotectOrLegacy(bytes);
+                return Encoding.UTF8.GetString(plain);
             }
             finally { CredFree(ptr); }
         }
@@ -654,6 +679,24 @@ namespace SysmonWidget
         public static void Delete(string target)
         {
             CredDelete(target, CredTypeGeneric, 0);
+        }
+
+        static byte[] Protect(byte[] plain)
+        {
+            return ProtectedData.Protect(plain, DpapiEntropy, DataProtectionScope.CurrentUser);
+        }
+
+        static byte[] UnprotectOrLegacy(byte[] bytes)
+        {
+            try
+            {
+                return ProtectedData.Unprotect(bytes, DpapiEntropy, DataProtectionScope.CurrentUser);
+            }
+            catch (CryptographicException)
+            {
+                // v1.2.2 以前の平文 Credential Manager エントリ
+                return bytes;
+            }
         }
     }
 }

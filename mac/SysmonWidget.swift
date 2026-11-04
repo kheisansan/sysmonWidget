@@ -251,6 +251,7 @@ final class Settings {
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try lines.joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         } catch {}
     }
 
@@ -1843,6 +1844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.save()
         ensureSideWidth()
         if settings.showGmail { ensureGmailFetch(force: true) }
+        // OFF 時は以降の ensureGmailFetch が no-op。進行中の認証待ちはタイムアウト／ユーザー操作待ち。
     }
 
     @objc private func gmailConnect() {
@@ -1890,7 +1892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stack.frame = NSRect(x: 0, y: 0, width: width, height: 64)
         let idField = NSTextField(string: current.clientId)
         idField.placeholderString = "Client ID"
-        let secretField = NSTextField(string: current.clientSecret)
+        let secretField = NSSecureTextField(string: current.clientSecret)
         secretField.placeholderString = "Client Secret（任意）"
         stack.addArrangedSubview(idField)
         stack.addArrangedSubview(secretField)

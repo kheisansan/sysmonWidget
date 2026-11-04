@@ -993,6 +993,10 @@ namespace SysmonWidget
             settings.Save();
             EnsureSideWidth();
             if (on) EnsureGmailFetch(true);
+            else if (gmailAuthCancel != null)
+            {
+                try { gmailAuthCancel.Cancel(); } catch { }
+            }
             Invalidate();
         }
 
@@ -1079,7 +1083,7 @@ namespace SysmonWidget
                 var l1 = new Label { Text = "Client ID", Left = 12, Top = 16, Width = 100 };
                 var t1 = new TextBox { Left = 120, Top = 12, Width = 300, Text = curId };
                 var l2 = new Label { Text = "Client Secret", Left = 12, Top = 52, Width = 100 };
-                var t2 = new TextBox { Left = 120, Top = 48, Width = 300, Text = curSecret };
+                var t2 = new TextBox { Left = 120, Top = 48, Width = 300, Text = curSecret, UseSystemPasswordChar = true };
                 var tip = new Label
                 {
                     Left = 12, Top = 84, Width = 410, Height = 40,

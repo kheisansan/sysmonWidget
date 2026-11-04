@@ -100,11 +100,11 @@ JSON をダウンロードした場合は、中の `client_id` / `client_secret`
 
 | 種類 | Windows | Mac |
 |------|---------|-----|
-| Client ID / Secret | Credential Manager（`SysmonWidget:GmailOAuthClient`） | Keychain（`com.sysmonwidget.mac.gmail` / `oauth-client`） |
-| OAuth トークン | Credential Manager（`SysmonWidget:GmailOAuth`） | Keychain（`com.sysmonwidget.mac.gmail` / `oauth`） |
+| Client ID / Secret | Credential Manager（`SysmonWidget:GmailOAuthClient`）＋ DPAPI（CurrentUser） | Keychain（`com.sysmonwidget.mac.gmail` / `oauth-client`、ThisDeviceOnly） |
+| OAuth トークン | Credential Manager（`SysmonWidget:GmailOAuth`）＋ DPAPI | Keychain（同上 service / `oauth`） |
 | その他の設定 | `%AppData%\SysmonWidget\settings.ini` | `~/Library/Application Support/SysmonWidget/settings.ini` |
 
-Client ID / Secret とトークンは OS の資格情報ストアに保存します。`settings.ini` には書きません（旧バージョンで ini に平文保存していた場合は、起動時に自動で移行して ini から削除します）。
+Client ID / Secret とトークンは OS の資格情報ストアに保存します。`settings.ini` には書きません（旧バージョンで ini に平文保存していた場合は、起動時に自動で移行して ini から削除します）。Windows では Credential Manager 上の値をさらに DPAPI でユーザー単位に保護します。
 
 ## 設定ファイル
 

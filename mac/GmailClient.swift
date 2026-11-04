@@ -69,6 +69,7 @@ final class GmailClient {
         let redirect = "http://127.0.0.1:\(listener.port)/"
         let verifier = Self.makeVerifier()
         let challenge = Self.makeChallenge(verifier)
+        let state = Self.makeVerifier()
         var comps = URLComponents(string: Self.authEndpoint)!
         comps.queryItems = [
             URLQueryItem(name: "client_id", value: clientId),
@@ -77,6 +78,7 @@ final class GmailClient {
             URLQueryItem(name: "scope", value: Self.scope),
             URLQueryItem(name: "access_type", value: "offline"),
             URLQueryItem(name: "prompt", value: "consent"),
+            URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256")
         ]
@@ -98,15 +100,29 @@ final class GmailClient {
 
         let code = req.query["code"]
         let err = req.query["error"]
+        let gotState = req.query["state"]
+        let stateOk = gotState == state
         let html: String
+        if let err, !err.isEmpty {
+            html = "<html><body style='font-family:sans-serif;padding:24px'>認証に失敗しました: \(Self.htmlEncode(err))</body></html>"
+            _ = req.respond(html)
+            setError("認証エラー: \(String(err.prefix(120)))")
+            return false
+        }
+        if !stateOk {
+            html = "<html><body style='font-family:sans-serif;padding:24px'>認証に失敗しました: state が一致しません</body></html>"
+            _ = req.respond(html)
+            setError("認証エラー: state が一致しません")
+            return false
+        }
         if let code, !code.isEmpty {
             html = "<html><body style='font-family:sans-serif;padding:24px'>認証できました。このタブを閉じてウィジェットに戻ってください。</body></html>"
             _ = req.respond(html)
             return exchangeCode(clientId: clientId, clientSecret: clientSecret, code: code, redirect: redirect, verifier: verifier)
         }
-        html = "<html><body style='font-family:sans-serif;padding:24px'>認証に失敗しました: \(err ?? "unknown")</body></html>"
+        html = "<html><body style='font-family:sans-serif;padding:24px'>認証に失敗しました: 認可コードがありません</body></html>"
         _ = req.respond(html)
-        setError("認証エラー: \(err ?? "unknown")")
+        setError("認証エラー: 認可コードがありません")
         return false
     }
 
@@ -120,7 +136,8 @@ final class GmailClient {
             var items: [GmailMailItem] = []
             for msg in messages {
                 guard let id = msg["id"] as? String else { continue }
-                let detailData = try httpGet("\(Self.apiBase)/messages/\(id)?format=metadata&metadataHeaders=From&metadataHeaders=Subject")
+                let encId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+                let detailData = try httpGet("\(Self.apiBase)/messages/\(encId)?format=metadata&metadataHeaders=From&metadataHeaders=Subject")
                 let detail = try JSONSerialization.jsonObject(with: detailData) as? [String: Any]
                 items.append(Self.parseHeaders(detail))
             }
@@ -296,8 +313,20 @@ final class GmailClient {
             .replacingOccurrences(of: "=", with: "")
     }
 
+    /// application/x-www-form-urlencoded（RFC 3986 unreserved 以外をエンコード）
     private static func esc(_ s: String) -> String {
-        s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+    }
+
+    private static func htmlEncode(_ s: String) -> String {
+        s
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
 }
 
@@ -309,7 +338,7 @@ enum Keychain {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
         SecItemAdd(query as CFDictionary, nil)
     }
