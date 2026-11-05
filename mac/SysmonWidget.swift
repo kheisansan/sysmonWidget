@@ -1304,6 +1304,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var suppressStatusAction = false
     private var gmailNextFetch = Date.distantPast
     private var gmailFetching = false
+    private var gmailFetchGen = 0
+    private var gmailAuthGen = 0
     private var metricsTick = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1638,8 +1640,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gmailShowItem = gmailShow
         let gmailConnect = NSMenuItem(title: "接続…", action: #selector(gmailConnect), keyEquivalent: "")
         gmailConnect.target = self
-        let gmailDisconnect = NSMenuItem(title: "切断", action: #selector(gmailDisconnect), keyEquivalent: "")
-        gmailDisconnect.target = self
         let gmailCred = NSMenuItem(title: "Client ID を設定…", action: #selector(gmailEditCredentials), keyEquivalent: "")
         gmailCred.target = self
         let gmailRefresh = NSMenuItem(title: "今すぐ更新", action: #selector(gmailRefreshNow), keyEquivalent: "")
@@ -1671,7 +1671,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gmailMenu.addItem(gmailShow)
         gmailMenu.addItem(.separator())
         gmailMenu.addItem(gmailConnect)
-        gmailMenu.addItem(gmailDisconnect)
         gmailMenu.addItem(gmailCred)
         gmailMenu.addItem(gmailRefresh)
         gmailMenu.addItem(countItem)
@@ -1843,8 +1842,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.showGmail.toggle()
         settings.save()
         ensureSideWidth()
-        if settings.showGmail { ensureGmailFetch(force: true) }
-        // OFF 時は以降の ensureGmailFetch が no-op。進行中の認証待ちはタイムアウト／ユーザー操作待ち。
+        if settings.showGmail {
+            gmailNextFetch = .distantPast
+            ensureGmailFetch(force: true)
+        } else {
+            // 非表示の間は更新もトークン再発行もしない
+            gmailFetchGen += 1
+            gmailFetching = false
+        }
     }
 
     @objc private func gmailConnect() {
@@ -1858,24 +1863,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         widget?.needsDisplay = true
         let cid = creds.clientId
         let secret = creds.clientSecret
+        gmailAuthGen += 1
+        let gen = gmailAuthGen
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let ok = self.gmail.authorizeInteractive(clientId: cid, clientSecret: secret)
+            let err = self.gmail.lastError
             DispatchQueue.main.async {
+                guard gen == self.gmailAuthGen else { return }
                 self.widget?.gmailAuthorized = self.gmail.isAuthorized
-                self.widget?.gmailStatus = ok ? "接続済み" : (self.gmail.lastError.isEmpty ? "認証失敗" : self.gmail.lastError)
+                self.widget?.gmailStatus = ok ? "接続済み" : (err.isEmpty ? "認証失敗" : err)
                 self.widget?.needsDisplay = true
-                if ok { self.ensureGmailFetch(force: true) }
+                if ok, self.settings.showGmail { self.ensureGmailFetch(force: true) }
             }
         }
-    }
-
-    @objc private func gmailDisconnect() {
-        gmail.clearTokens()
-        widget?.gmailItems = []
-        widget?.gmailAuthorized = false
-        widget?.gmailStatus = "未接続"
-        widget?.needsDisplay = true
     }
 
     @objc private func gmailEditCredentials() {
@@ -1944,12 +1945,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         widget?.needsDisplay = true
         let creds = GmailAppCredentials.load()
         let count = settings.gmailCount
+        let gen = gmailFetchGen
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
+            guard gen == self.gmailFetchGen, self.settings.showGmail else {
+                DispatchQueue.main.async { [weak self] in self?.gmailFetching = false }
+                return
+            }
             let ok = self.gmail.refreshInbox(clientId: creds.clientId, clientSecret: creds.clientSecret, count: count)
             let items = self.gmail.snapshot()
             let err = self.gmail.lastError
             DispatchQueue.main.async {
+                guard gen == self.gmailFetchGen, self.settings.showGmail else {
+                    self.gmailFetching = false
+                    return
+                }
                 self.gmailFetching = false
                 self.widget?.gmailAuthorized = self.gmail.isAuthorized
                 if ok {

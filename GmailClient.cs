@@ -37,6 +37,8 @@ namespace SysmonWidget
         }
 
         readonly object gate = new object();
+        readonly object authLock = new object();
+        HttpWebRequest inflight;
         string accessToken;
         string refreshToken;
         DateTime accessExpiresUtc = DateTime.MinValue;
@@ -96,134 +98,88 @@ namespace SysmonWidget
             CredStore.Delete(CredTarget);
         }
 
-        public bool AuthorizeInteractive(string clientId, string clientSecret, CancellationToken cancel)
+        /// <summary>表示を消したときに、進行中のトークン更新・メール取得を止める。</summary>
+        public void AbortRequests()
         {
-            if (string.IsNullOrEmpty(clientId))
-            {
-                SetError("Gmail Client ID が未設定です");
-                return false;
-            }
-
-            string verifier = MakeVerifier();
-            string challenge = MakeChallenge(verifier);
-            TcpListener listener = null;
-            int port = 0;
-            try
-            {
-                listener = new TcpListener(IPAddress.Loopback, 0);
-                listener.Start();
-                port = ((IPEndPoint)listener.LocalEndpoint).Port;
-            }
-            catch (Exception ex)
-            {
-                SetError("ローカル待受の開始に失敗しました: " + ex.Message);
-                return false;
-            }
-
-            string redirect = "http://127.0.0.1:" + port + "/";
-            string state = MakeVerifier();
-            string url = AuthEndpoint
-                + "?client_id=" + Uri.EscapeDataString(clientId)
-                + "&redirect_uri=" + Uri.EscapeDataString(redirect)
-                + "&response_type=code"
-                + "&scope=" + Uri.EscapeDataString(Scope)
-                + "&access_type=offline"
-                + "&prompt=consent"
-                + "&state=" + Uri.EscapeDataString(state)
-                + "&code_challenge=" + Uri.EscapeDataString(challenge)
-                + "&code_challenge_method=S256";
-
-            try
-            {
-                System.Diagnostics.Process.Start(url);
-            }
-            catch (Exception ex)
-            {
-                try { listener.Stop(); } catch { }
-                SetError("ブラウザを開けません: " + ex.Message);
-                return false;
-            }
-
-            string code = null;
-            try
-            {
-                IAsyncResult ar = listener.BeginAcceptTcpClient(null, null);
-                int idx = WaitHandle.WaitAny(new WaitHandle[] { ar.AsyncWaitHandle, cancel.WaitHandle }, 180000);
-                if (idx != 0)
-                {
-                    SetError(cancel.IsCancellationRequested ? "キャンセルされました" : "認証がタイムアウトしました");
-                }
-                else
-                {
-                    using (TcpClient client = listener.EndAcceptTcpClient(ar))
-                    using (NetworkStream ns = client.GetStream())
-                    {
-                        ns.ReadTimeout = 10000;
-                        string req = ReadHttpRequest(ns);
-                        string first = FirstLine(req);
-                        string pathQuery = first.Split(' ').Length > 1 ? first.Split(' ')[1] : "";
-                        int qmark = pathQuery.IndexOf('?');
-                        string q = qmark >= 0 ? pathQuery.Substring(qmark) : "";
-                        code = QueryValue(q, "code");
-                        string err = QueryValue(q, "error");
-                        string gotState = QueryValue(q, "state");
-                        bool stateOk = string.Equals(state, gotState, StringComparison.Ordinal);
-                        string msg;
-                        if (!string.IsNullOrEmpty(err))
-                            msg = "認証に失敗しました: " + HtmlEncode(err);
-                        else if (!stateOk)
-                            msg = "認証に失敗しました: state が一致しません";
-                        else if (string.IsNullOrEmpty(code))
-                            msg = "認証に失敗しました: 認可コードがありません";
-                        else
-                            msg = "認証できました。このタブを閉じてウィジェットに戻ってください。";
-                        string html = "<html><body style='font-family:sans-serif;padding:24px'>" + msg + "</body></html>";
-                        byte[] body = Encoding.UTF8.GetBytes(html);
-                        string header = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "
-                            + body.Length + "\r\nConnection: close\r\n\r\n";
-                        byte[] hb = Encoding.ASCII.GetBytes(header);
-                        ns.Write(hb, 0, hb.Length);
-                        ns.Write(body, 0, body.Length);
-                        if (!string.IsNullOrEmpty(err))
-                        {
-                            SetError("認証エラー: " + Trunc(err, 120));
-                            code = null;
-                        }
-                        else if (!stateOk)
-                        {
-                            SetError("認証エラー: state が一致しません");
-                            code = null;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                SetError("認証待受エラー: " + ex.Message);
-                code = null;
-            }
-            finally
-            {
-                try { listener.Stop(); } catch { }
-            }
-
-            if (string.IsNullOrEmpty(code)) return false;
-            return ExchangeCode(clientId, clientSecret, code, redirect, verifier);
+            HttpWebRequest req;
+            lock (gate) req = inflight;
+            if (req != null) try { req.Abort(); } catch { }
         }
 
-        public bool RefreshInbox(string clientId, string clientSecret, int count)
+        public bool AuthorizeInteractive(string clientId, string clientSecret, CancellationToken cancel)
+        {
+            // 前回の待受を閉じ切ってから次を開く。重ねると 127.0.0.1 が拒否される。
+            lock (authLock)
+            {
+                if (string.IsNullOrEmpty(clientId))
+                {
+                    SetError("Gmail Client ID が未設定です");
+                    return false;
+                }
+
+                string verifier = MakeVerifier();
+                string challenge = MakeChallenge(verifier);
+                LoopbackOAuthServer server;
+                try { server = new LoopbackOAuthServer(); }
+                catch (Exception ex)
+                {
+                    SetError("ローカル待受の開始に失敗しました: " + ex.Message);
+                    return false;
+                }
+
+                using (server)
+                {
+                    string redirect = "http://127.0.0.1:" + server.Port + "/";
+                    string state = MakeVerifier();
+                    string url = AuthEndpoint
+                        + "?client_id=" + Uri.EscapeDataString(clientId)
+                        + "&redirect_uri=" + Uri.EscapeDataString(redirect)
+                        + "&response_type=code"
+                        + "&scope=" + Uri.EscapeDataString(Scope)
+                        + "&access_type=offline"
+                        + "&prompt=consent"
+                        + "&state=" + Uri.EscapeDataString(state)
+                        + "&code_challenge=" + Uri.EscapeDataString(challenge)
+                        + "&code_challenge_method=S256";
+
+                    try { System.Diagnostics.Process.Start(url); }
+                    catch (Exception ex)
+                    {
+                        SetError("ブラウザを開けません: " + ex.Message);
+                        return false;
+                    }
+
+                    string code;
+                    string err;
+                    if (!server.WaitForCode(state, cancel, 180000, out code, out err))
+                    {
+                        SetError(cancel.IsCancellationRequested ? "キャンセルされました"
+                            : (string.IsNullOrEmpty(err) ? "認証がタイムアウトしました" : err));
+                        return false;
+                    }
+                    return ExchangeCode(clientId, clientSecret, code, redirect, verifier);
+                }
+            }
+        }
+
+        /// <summary>stillWanted が false なら API を叩かず、トークンも更新しない。</summary>
+        public bool RefreshInbox(string clientId, string clientSecret, int count, Func<bool> stillWanted)
         {
             count = Math.Max(3, Math.Min(10, count));
             try
             {
+                if (stillWanted != null && !stillWanted()) return false;
                 if (!EnsureAccessToken(clientId, clientSecret)) return false;
+                if (stillWanted != null && !stillWanted()) return false;
                 string listJson = HttpGet(ApiBase + "/messages?labelIds=INBOX&maxResults=" + count);
+                if (stillWanted != null && !stillWanted()) return false;
                 MessageList list = FromJson<MessageList>(listJson);
                 var items = new List<GmailMailItem>();
                 if (list != null && list.messages != null)
                 {
                     foreach (MessageRef mr in list.messages)
                     {
+                        if (stillWanted != null && !stillWanted()) return false;
                         if (mr == null || string.IsNullOrEmpty(mr.id)) continue;
                         string detail = HttpGet(ApiBase + "/messages/" + Uri.EscapeDataString(mr.id)
                             + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject");
@@ -231,6 +187,7 @@ namespace SysmonWidget
                         items.Add(ParseHeaders(md));
                     }
                 }
+                if (stillWanted != null && !stillWanted()) return false;
                 lock (gate)
                 {
                     cache = items.ToArray();
@@ -241,6 +198,7 @@ namespace SysmonWidget
             }
             catch (Exception ex)
             {
+                if (stillWanted != null && !stillWanted()) return false;
                 SetError(ex.Message);
                 return false;
             }
@@ -373,10 +331,10 @@ namespace SysmonWidget
             req.Method = "GET";
             req.Headers["Authorization"] = "Bearer " + token;
             req.Timeout = 20000;
-            return ReadResponse(req);
+            return SendTracked(req, null);
         }
 
-        static string HttpPost(string url, string formBody)
+        string HttpPost(string url, string formBody)
         {
             byte[] data = Encoding.UTF8.GetBytes(formBody);
             var req = (HttpWebRequest)WebRequest.Create(url);
@@ -384,8 +342,22 @@ namespace SysmonWidget
             req.ContentType = "application/x-www-form-urlencoded";
             req.Timeout = 20000;
             req.ContentLength = data.Length;
-            using (Stream s = req.GetRequestStream()) s.Write(data, 0, data.Length);
-            return ReadResponse(req);
+            return SendTracked(req, data);
+        }
+
+        string SendTracked(HttpWebRequest req, byte[] body)
+        {
+            lock (gate) inflight = req;
+            try
+            {
+                if (body != null)
+                    using (Stream s = req.GetRequestStream()) s.Write(body, 0, body.Length);
+                return ReadResponse(req);
+            }
+            finally
+            {
+                lock (gate) if (inflight == req) inflight = null;
+            }
         }
 
         static string ReadResponse(HttpWebRequest req)
@@ -500,6 +472,242 @@ namespace SysmonWidget
                 var ser = new DataContractJsonSerializer(typeof(T));
                 ser.WriteObject(ms, obj);
                 return Encoding.UTF8.GetString(ms.ToArray());
+            }
+        }
+
+        /// <summary>
+        /// 127.0.0.1 で認可コードが届くまで待ち受ける。
+        /// ブラウザやセキュリティソフトの先回り接続（favicon や空接続）では閉じない。
+        /// </summary>
+        sealed class LoopbackOAuthServer : IDisposable
+        {
+            readonly TcpListener listener;
+            IAsyncResult pending;
+            public readonly int Port;
+
+            public LoopbackOAuthServer()
+            {
+                Exception last = null;
+                TcpListener bound = null;
+                for (int attempt = 0; attempt < 5 && bound == null; attempt++)
+                {
+                    var l = new TcpListener(IPAddress.Loopback, 0);
+                    try
+                    {
+                        l.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                        l.Start(16);
+                        bound = l;
+                    }
+                    catch (Exception ex)
+                    {
+                        last = ex;
+                        try { l.Stop(); } catch { }
+                    }
+                }
+                if (bound == null) throw last ?? new IOException("127.0.0.1 で待受できません");
+                listener = bound;
+                Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            }
+
+            public bool WaitForCode(string expectedState, CancellationToken cancel, int timeoutMs, out string code, out string error)
+            {
+                code = null;
+                error = null;
+                int start = Environment.TickCount;
+                pending = listener.BeginAcceptTcpClient(null, null);
+                try
+                {
+                    while (true)
+                    {
+                        if (cancel.IsCancellationRequested) return false;
+                        int remain = timeoutMs - unchecked(Environment.TickCount - start);
+                        if (remain <= 0) return false;
+                        int idx = WaitHandle.WaitAny(
+                            new WaitHandle[] { pending.AsyncWaitHandle, cancel.WaitHandle }, remain);
+                        if (idx != 0) return false;
+                        TcpClient client;
+                        try { client = listener.EndAcceptTcpClient(pending); }
+                        catch { return false; }
+                        pending = null;
+                        bool done = HandleClient(client, expectedState, out code, out error);
+                        if (done) return code != null;
+                        pending = listener.BeginAcceptTcpClient(null, null);
+                    }
+                }
+                finally { Dispose(); }
+            }
+
+            bool HandleClient(TcpClient client, string expectedState, out string code, out string error)
+            {
+                code = null;
+                error = null;
+                using (client)
+                {
+                    try { client.LingerState = new LingerOption(true, 0); } catch { }
+                    string method = "GET", query = "";
+                    try
+                    {
+                        client.ReceiveTimeout = 1000;
+                        using (NetworkStream ns = client.GetStream())
+                        {
+                            string req = ReadHttpRequest(ns);
+                            string first = FirstLine(req);
+                            string[] parts = first.Split(' ');
+                            if (parts.Length > 0 && parts[0].Length > 0) method = parts[0];
+                            string path = parts.Length > 1 ? parts[1] : "";
+                            int qmark = path.IndexOf('?');
+                            query = qmark >= 0 ? path.Substring(qmark) : "";
+                            if (string.Equals(method, "OPTIONS", StringComparison.OrdinalIgnoreCase))
+                            {
+                                WriteHttp(ns, 204, "No Content", "");
+                                return false;
+                            }
+                            string gotCode = QueryValue(query, "code");
+                            string gotErr = QueryValue(query, "error");
+                            string gotState = QueryValue(query, "state");
+                            bool oauth = gotCode != null || gotErr != null || gotState != null;
+                            if (!oauth)
+                            {
+                                WriteHttp(ns, 200, "OK", "");
+                                return false;
+                            }
+                            bool stateOk = string.Equals(expectedState, gotState, StringComparison.Ordinal);
+                            string msg;
+                            if (!string.IsNullOrEmpty(gotErr))
+                            {
+                                error = "認証エラー: " + Trunc(gotErr, 120);
+                                msg = "認証に失敗しました: " + HtmlEncode(gotErr);
+                            }
+                            else if (!stateOk)
+                            {
+                                error = "認証エラー: state が一致しません";
+                                msg = "認証に失敗しました: state が一致しません";
+                            }
+                            else if (string.IsNullOrEmpty(gotCode))
+                            {
+                                error = "認証エラー: 認可コードがありません";
+                                msg = "認証に失敗しました: 認可コードがありません";
+                            }
+                            else
+                            {
+                                code = gotCode;
+                                msg = "認証できました。このタブを閉じてウィジェットに戻ってください。";
+                            }
+                            string html = "<html><body style='font-family:sans-serif;padding:24px'>" + msg + "</body></html>";
+                            WriteHttp(ns, 200, "OK", html);
+                            return true;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            static void WriteHttp(NetworkStream ns, int status, string reason, string body)
+            {
+                byte[] bytes = Encoding.UTF8.GetBytes(body ?? "");
+                string header = "HTTP/1.1 " + status + " " + reason + "\r\n"
+                    + "Content-Type: text/html; charset=utf-8\r\n"
+                    + "Content-Length: " + bytes.Length + "\r\n"
+                    + "Access-Control-Allow-Origin: *\r\n"
+                    + "Access-Control-Allow-Private-Network: true\r\n"
+                    + "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                    + "Cache-Control: no-store\r\n"
+                    + "Connection: close\r\n\r\n";
+                byte[] hb = Encoding.ASCII.GetBytes(header);
+                ns.Write(hb, 0, hb.Length);
+                if (bytes.Length > 0) ns.Write(bytes, 0, bytes.Length);
+            }
+
+            public void Dispose()
+            {
+                try { listener.Stop(); } catch { }
+                IAsyncResult ar = pending;
+                pending = null;
+                if (ar == null) return;
+                try { if (!ar.IsCompleted) ar.AsyncWaitHandle.WaitOne(200); } catch { }
+                try { using (listener.EndAcceptTcpClient(ar)) { } } catch { }
+            }
+        }
+
+        internal static int RunLoopbackSelfTest()
+        {
+            int fails = 0;
+            fails += LoopbackRound(0, true);
+            fails += LoopbackRound(1, true);
+            fails += LoopbackRound(2, false);
+            fails += CancelRound();
+            fails += LoopbackRound(3, true);
+            return fails;
+        }
+
+        static int CancelRound()
+        {
+            var cts = new CancellationTokenSource();
+            var server = new LoopbackOAuthServer();
+            bool ok = true;
+            string code = "x";
+            var worker = new Thread(() =>
+            {
+                string err;
+                ok = server.WaitForCode("x", cts.Token, 10000, out code, out err);
+            });
+            worker.IsBackground = true;
+            worker.Start();
+            Thread.Sleep(150);
+            cts.Cancel();
+            if (!worker.Join(3000))
+            {
+                try { server.Dispose(); } catch { }
+                return 1;
+            }
+            return (ok || code != null) ? 1 : 0;
+        }
+
+        static int LoopbackRound(int n, bool withProbe)
+        {
+            var server = new LoopbackOAuthServer();
+            string state = "state" + n;
+            string got = null;
+            string err = null;
+            bool ok = false;
+            var worker = new Thread(() =>
+            {
+                ok = server.WaitForCode(state, CancellationToken.None, 8000, out got, out err);
+            });
+            worker.IsBackground = true;
+            worker.Start();
+            Thread.Sleep(80);
+            if (withProbe)
+            {
+                try
+                {
+                    var idle = new TcpClient("127.0.0.1", server.Port);
+                    HttpSend(server.Port, "GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+                    Thread.Sleep(50);
+                    idle.Close();
+                }
+                catch { }
+            }
+            HttpSend(server.Port, "GET /?code=code" + n + "&state=" + state
+                + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            if (!worker.Join(5000)) { try { server.Dispose(); } catch { } return 1; }
+            if (!ok || got != "code" + n || !string.IsNullOrEmpty(err)) return 1;
+            return 0;
+        }
+
+        static void HttpSend(int port, string request)
+        {
+            using (var c = new TcpClient("127.0.0.1", port))
+            using (NetworkStream ns = c.GetStream())
+            {
+                byte[] b = Encoding.ASCII.GetBytes(request);
+                ns.Write(b, 0, b.Length);
+                ns.ReadTimeout = 2000;
+                var buf = new byte[512];
+                try { ns.Read(buf, 0, buf.Length); } catch { }
             }
         }
 

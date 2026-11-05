@@ -28,6 +28,14 @@ namespace SysmonWidget
                 SelfTest.Run();
                 return;
             }
+            if (args.Length > 0 && args[0] == "--loopback-test")
+            {
+                SelfTest.AttachParent();
+                int fails = GmailClient.RunLoopbackSelfTest();
+                Console.WriteLine(fails == 0 ? "loopback ok" : "loopback FAIL " + fails);
+                Environment.ExitCode = fails == 0 ? 0 : 1;
+                return;
+            }
 
             bool created;
             using (var mutex = new Mutex(true, "SysmonWidget_SingleInstance", out created))
@@ -46,9 +54,11 @@ namespace SysmonWidget
         [DllImport("kernel32.dll")]
         static extern bool AttachConsole(int pid);
 
+        public static void AttachParent() { try { AttachConsole(-1); } catch { } }
+
         public static void Run()
         {
-            AttachConsole(-1);
+            AttachParent();
             var collector = new MetricsCollector();
             for (int i = 0; i < 4; i++)
             {
@@ -471,6 +481,7 @@ namespace SysmonWidget
         GmailMailItem[] gmailItems = new GmailMailItem[0];
         string gmailStatus = "";
         DateTime gmailNextFetchUtc = DateTime.MinValue;
+        int gmailFetchGen, gmailAuthGen;
 
         NotifyIcon tray;
         ContextMenuStrip menu;
@@ -852,13 +863,6 @@ namespace SysmonWidget
             miGmail = new ToolStripMenuItem("Gmail");
             var miGmailShow = new ToolStripMenuItem("表示する", null, (s, e) => ToggleGmail(!settings.ShowGmail));
             var miGmailConnect = new ToolStripMenuItem("接続…", null, (s, e) => BeginGmailAuth());
-            var miGmailDisconnect = new ToolStripMenuItem("切断", null, (s, e) =>
-            {
-                gmail.ClearTokens();
-                gmailItems = new GmailMailItem[0];
-                gmailStatus = "未接続";
-                Invalidate();
-            });
             var miGmailCred = new ToolStripMenuItem("Client ID を設定…", null, (s, e) => EditGmailCredentials());
             var miGmailRefresh = new ToolStripMenuItem("今すぐ更新", null, (s, e) => EnsureGmailFetch(true));
             var miGmailCount = new ToolStripMenuItem("表示件数");
@@ -905,7 +909,6 @@ namespace SysmonWidget
             miGmail.DropDownItems.Add(miGmailShow);
             miGmail.DropDownItems.Add(new ToolStripSeparator());
             miGmail.DropDownItems.Add(miGmailConnect);
-            miGmail.DropDownItems.Add(miGmailDisconnect);
             miGmail.DropDownItems.Add(miGmailCred);
             miGmail.DropDownItems.Add(miGmailRefresh);
             miGmail.DropDownItems.Add(miGmailCount);
@@ -915,7 +918,6 @@ namespace SysmonWidget
                 miGmailShow.Checked = settings.ShowGmail;
                 bool on = settings.ShowGmail;
                 miGmailConnect.Enabled = on;
-                miGmailDisconnect.Enabled = on && gmail.IsAuthorized;
                 miGmailRefresh.Enabled = on && gmail.IsAuthorized;
                 miGmailCount.Enabled = on;
                 miGmailInterval.Enabled = on;
@@ -992,10 +994,21 @@ namespace SysmonWidget
             settings.ShowGmail = on;
             settings.Save();
             EnsureSideWidth();
-            if (on) EnsureGmailFetch(true);
-            else if (gmailAuthCancel != null)
+            if (on)
             {
-                try { gmailAuthCancel.Cancel(); } catch { }
+                gmailNextFetchUtc = DateTime.MinValue;
+                EnsureGmailFetch(true);
+            }
+            else
+            {
+                // 非表示の間は更新もトークン再発行もしない
+                Interlocked.Increment(ref gmailFetchGen);
+                gmailNextFetchUtc = DateTime.MaxValue;
+                gmail.AbortRequests();
+                if (gmailAuthCancel != null)
+                {
+                    try { gmailAuthCancel.Cancel(); } catch { }
+                }
             }
             Invalidate();
         }
@@ -1119,18 +1132,21 @@ namespace SysmonWidget
                 try { gmailAuthCancel.Cancel(); } catch { }
             }
             gmailAuthCancel = new CancellationTokenSource();
+            int gen = Interlocked.Increment(ref gmailAuthGen);
             gmailStatus = "ブラウザで認証中…";
             Invalidate();
             CancellationToken token = gmailAuthCancel.Token;
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 bool ok = gmail.AuthorizeInteractive(cid, secret, token);
+                string err = gmail.LastError;
                 if (IsHandleCreated && !IsDisposed)
                 {
                     BeginInvoke(new Action(delegate
                     {
-                        gmailStatus = ok ? "接続済み" : (gmail.LastError.Length > 0 ? gmail.LastError : "認証失敗");
-                        if (ok) EnsureGmailFetch(true);
+                        if (gen != gmailAuthGen) return;
+                        gmailStatus = ok ? "接続済み" : (err != null && err.Length > 0 ? err : "認証失敗");
+                        if (ok && settings.ShowGmail) EnsureGmailFetch(true);
                         Invalidate();
                     }));
                 }
@@ -1160,15 +1176,20 @@ namespace SysmonWidget
             string cid, secret;
             GmailAppCredentials.Load(out cid, out secret);
             int count = settings.GmailCount;
+            int gen = gmailFetchGen;
             gmailWorker = new Thread(() =>
             {
-                bool ok = gmail.RefreshInbox(cid, secret, count);
+                Func<bool> wanted = () => gen == Interlocked.CompareExchange(ref gmailFetchGen, 0, 0) && settings.ShowGmail;
+                if (!wanted()) return;
+                bool ok = gmail.RefreshInbox(cid, secret, count, wanted);
+                if (!wanted()) return;
                 GmailMailItem[] items = gmail.Snapshot();
                 string err = gmail.LastError;
                 if (IsHandleCreated && !IsDisposed)
                 {
                     BeginInvoke(new Action(delegate
                     {
+                        if (gen != gmailFetchGen || !settings.ShowGmail) return;
                         if (ok) { gmailItems = items; gmailStatus = ""; }
                         else gmailStatus = string.IsNullOrEmpty(err) ? "取得失敗" : err;
                         Invalidate();

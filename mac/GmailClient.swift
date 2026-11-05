@@ -18,6 +18,8 @@ final class GmailClient {
     private static let apiBase = "https://gmail.googleapis.com/gmail/v1/users/me"
 
     private let lock = NSLock()
+    private let authLock = NSLock()
+    private var activeListener: LoopbackServer?
     private var accessToken: String?
     private var refreshToken: String?
     private var accessExpires = Date.distantPast
@@ -58,6 +60,18 @@ final class GmailClient {
     }
 
     func authorizeInteractive(clientId: String, clientSecret: String) -> Bool {
+        // 進行中の待受があれば閉じてから、次の認証を1本だけ走らせる
+        lock.lock()
+        let previous = activeListener
+        lock.unlock()
+        previous?.close()
+        authLock.lock()
+        defer {
+            lock.lock()
+            activeListener = nil
+            lock.unlock()
+            authLock.unlock()
+        }
         if clientId.isEmpty {
             setError("Gmail Client ID が未設定です")
             return false
@@ -66,6 +80,9 @@ final class GmailClient {
             setError("ローカル待受の開始に失敗しました")
             return false
         }
+        lock.lock()
+        activeListener = listener
+        lock.unlock()
         let redirect = "http://127.0.0.1:\(listener.port)/"
         let verifier = Self.makeVerifier()
         let challenge = Self.makeChallenge(verifier)
@@ -443,17 +460,41 @@ private final class LoopbackServer {
         }
     }
 
+    /// 認可コードが届くまで受け続ける。favicon や空接続では待受を閉じない。
     func acceptHTTP(timeout: Int) -> Request? {
-        var tv = timeval(tv_sec: timeout, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
-        var addr = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let client: Int32 = withUnsafeMutablePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                accept(fd, $0, &len)
+        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        while Date() < deadline {
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let remainMs = Int32(min(1000, max(1, deadline.timeIntervalSinceNow * 1000)))
+            let rc = poll(&pfd, 1, remainMs)
+            if rc < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if rc == 0 { continue }
+            let bad = Int16(POLLNVAL) | Int16(POLLERR) | Int16(POLLHUP)
+            if (pfd.revents & bad) != 0 { return nil }
+            var addr = sockaddr_in()
+            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let client: Int32 = withUnsafeMutablePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(fd, $0, &len)
+                }
+            }
+            if client < 0 {
+                if errno == EBADF || errno == EINVAL { return nil }
+                continue
+            }
+            if let req = readRequest(client), Self.isOAuth(req.query) {
+                return req
             }
         }
-        guard client >= 0 else { return nil }
+        return nil
+    }
+
+    private func readRequest(_ client: Int32) -> Request? {
+        var tv = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
         var buf = [UInt8](repeating: 0, count: 4096)
         var raw = ""
         while !raw.contains("\r\n\r\n") {
@@ -464,10 +505,22 @@ private final class LoopbackServer {
         }
         let first = raw.split(separator: "\r\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
         let parts = first.split(separator: " ")
+        let method = parts.first.map(String.init) ?? "GET"
         let path = parts.count > 1 ? String(parts[1]) : ""
         let qIndex = path.firstIndex(of: "?")
         let q = qIndex.map { String(path[$0...]) } ?? ""
-        return Request(query: Self.parseQuery(q), client: client)
+        let query = Self.parseQuery(q)
+        if method.uppercased() == "OPTIONS" || !Self.isOAuth(query) {
+            let header = Array("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nAccess-Control-Allow-Private-Network: true\r\nConnection: close\r\n\r\n".utf8)
+            _ = header.withUnsafeBufferPointer { write(client, $0.baseAddress!, $0.count) }
+            Darwin.close(client)
+            return nil
+        }
+        return Request(query: query, client: client)
+    }
+
+    private static func isOAuth(_ query: [String: String]) -> Bool {
+        query["code"] != nil || query["error"] != nil || query["state"] != nil
     }
 
     private static func parseQuery(_ q: String) -> [String: String] {
